@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { supabase, PICE_ORG_ID } from './services/supabase';
+import { supabase } from './services/supabase'; // 👈 Fixed relative path for central FCO profiles
+import { piceClient, PICE_ORG_ID } from './services/piceClient'; // 👈 Fixed path and imported PICE secondary client
 import Sidebar from './components/Sidebar';
 import OverviewTab from './components/OverviewTab';
 import EventsTab from './components/EventsTab';
@@ -7,7 +8,7 @@ import MasterlistTab from './components/MasterlistTab';
 import AttendanceTab from './components/AttendanceTab';
 import FineManagementTab from './components/FineManagementTab';
 import StudentSummaryTab from './components/StudentSummaryTab';
-import ReportsTab from './components/ReportsTab'; // <--- 1. IMPORT REPORTS TAB
+import ReportsTab from './components/ReportsTab';
 import LandingPage from './components/LandingPage';
 
 export default function App() {
@@ -28,27 +29,33 @@ export default function App() {
   }, [showLanding]);
 
   async function fetchAllData() {
-    const { data: studentData } = await supabase
-      .from('profiles')
-      .select('*')
-      .or('course.ilike.%Civil%,course.ilike.%BSCE%');
-    setStudents(studentData || []);
+    try {
+      // 1. Fetch student profiles from Main FCO database
+      const { data: studentData } = await supabase
+        .from('profiles')
+        .select('*')
+        .or('course.ilike.%Civil%,course.ilike.%BSCE%');
+      setStudents(studentData || []);
 
-    const { data: eventData } = await supabase
-      .from('pice_events')
-      .select('*')
-      .eq('organization_id', PICE_ORG_ID);
-    setEvents(eventData || []);
+      // 2. Fetch PICE sub-organization tables from Secondary Attendance Database via piceClient
+      const { data: eventData } = await piceClient
+        .from('pice_events')
+        .select('*')
+        .eq('organization_id', PICE_ORG_ID);
+      setEvents(eventData || []);
 
-    const { data: attData } = await supabase
-      .from('pice_attendance')
-      .select('*');
-    setAttendance(attData || []);
+      const { data: attData } = await piceClient
+        .from('pice_attendance')
+        .select('*');
+      setAttendance(attData || []);
 
-    const { data: fineData } = await supabase
-      .from('pice_fines')
-      .select('*');
-    setFines(fineData || []);
+      const { data: fineData } = await piceClient
+        .from('pice_fines')
+        .select('*');
+      setFines(fineData || []);
+    } catch (err) {
+      console.error('Error fetching global PICE app data:', err);
+    }
   }
 
   function handleLoginSuccess() {
@@ -107,7 +114,6 @@ export default function App() {
           <StudentSummaryTab currentUser={{ email: 'pice.admin@essu.edu.ph' }} />
         )}
 
-        {/* 2. RENDER THE REPORTS TAB HERE */}
         {(currentTab === 'reports' || currentTab === 'audit' || currentTab === 'reports-audits') && (
           <ReportsTab currentUser={{ email: 'pice.admin@essu.edu.ph' }} />
         )}

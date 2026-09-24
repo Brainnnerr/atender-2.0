@@ -1,14 +1,21 @@
+// src/services/supabase.js
 import { createClient } from '@supabase/supabase-js';
 
-const SUPABASE_URL = 'https://brgmvckpvkguxkpeqsuk.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJyZ212Y2twdmtndXhrcGVxc3VrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY5MzcyNzYsImV4cCI6MjEwMjUxMzI3Nn0.YG5Fo0IrFbUpjoxBlzzxS981numvQhMrrXLBRhilhIw';
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.error("❌ CRITICAL: VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY is missing from your .env file!");
+}
+
+// 🚀 Use a named export so { supabase } imports work seamlessly everywhere
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
-    storageKey: 'pice-admin-auth-token',
+    storageKey: 'main-fco-auth-token',
     persistSession: true,
     autoRefreshToken: true,
   }
 });
 
-export const PICE_ORG_ID = '00000000-0000-0000-0000-000000000003';
+// Main FCO Organization ID reference
+export const IIEE_ORG_ID = '00000000-0000-0000-0000-000000000002'; // Or your active FCO/IIEE UUID

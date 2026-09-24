@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { supabase } from '../services/supabase';
+import { supabase } from '../services/supabase'; // Main FCO database for student profiles
+import { piceClient, PICE_ORG_ID } from '../services/piceClient'; // Secondary PICE database client
+import { ChevronLeft, ChevronRight, Search } from 'lucide-react';
 
 export default function StudentSummaryTab({ currentUser }) {
   const [students, setStudents] = useState([]);
@@ -8,6 +10,10 @@ export default function StudentSummaryTab({ currentUser }) {
   const [semesterFilter, setSemesterFilter] = useState('1st Semester');
   const [summaryData, setSummaryData] = useState({ events: [], attendanceMap: {}, fines: [] });
   const [loading, setLoading] = useState(false);
+
+  // Pagination for Student List (10 per page for lightning-fast responsiveness)
+  const [studentPage, setStudentPage] = useState(1);
+  const STUDENTS_PAGE_SIZE = 10;
 
   useEffect(() => {
     fetchPICEStudentsList();
@@ -21,7 +27,6 @@ export default function StudentSummaryTab({ currentUser }) {
 
   const fetchPICEStudentsList = async () => {
     try {
-      // Filter strictly for BSCE / Civil engineering students
       const { data, error } = await supabase
         .from('profiles')
         .select('id, full_name, student_id, course, year_level, section, avatar_url, email')
@@ -44,43 +49,43 @@ export default function StudentSummaryTab({ currentUser }) {
     try {
       setLoading(true);
 
-      // 1. Fetch PICE Events
-      const { data: eventsData, error: evErr } = await supabase
-        .from('pice_events')
-        .select('*')
-        .order('start_time', { ascending: false });
-      if (evErr) throw evErr;
+      // 🚀 Optimized Parallel Fetching via piceClient
+      const [eventsRes, attRes, finesRes] = await Promise.all([
+        piceClient
+          .from('pice_events')
+          .select('*')
+          .eq('organization_id', PICE_ORG_ID)
+          .order('start_time', { ascending: false }),
+        piceClient
+          .from('pice_attendance')
+          .select('*')
+          .eq('student_id', studentId),
+        piceClient
+          .from('pice_fines')
+          .select('*')
+          .eq('student_id', studentId)
+          .eq('organization_id', PICE_ORG_ID)
+      ]);
 
-      // Filter events locally by semester if selected
-      const filteredEvents = (eventsData || []).filter(evt => {
+      if (eventsRes.error) throw eventsRes.error;
+      if (attRes.error) throw attRes.error;
+      if (finesRes.error) throw finesRes.error;
+
+      const filteredEvents = (eventsRes.data || []).filter(evt => {
         if (semesterFilter === 'ALL') return true;
         const sem = evt.semester || '1st Semester';
         return sem.toLowerCase() === semesterFilter.toLowerCase();
       });
 
-      // 2. Fetch PICE Attendance
-      const { data: attData, error: attErr } = await supabase
-        .from('pice_attendance')
-        .select('*')
-        .eq('student_id', studentId);
-      if (attErr) throw attErr;
-
-      // 3. Fetch PICE Fines
-      const { data: finesData, error: fineErr } = await supabase
-        .from('pice_fines')
-        .select('*')
-        .eq('student_id', studentId);
-      if (fineErr) throw fineErr;
-
       const attendanceMap = {};
-      (attData || []).forEach((att) => {
+      (attRes.data || []).forEach((att) => {
         attendanceMap[att.event_id] = att;
       });
 
       setSummaryData({
         events: filteredEvents,
         attendanceMap,
-        fines: finesData || [],
+        fines: finesRes.data || [],
       });
     } catch (err) {
       console.error('Error loading PICE student summary:', err);
@@ -89,12 +94,16 @@ export default function StudentSummaryTab({ currentUser }) {
     }
   };
 
+  // Filtered Students and Slicing for Pagination
   const filteredStudents = students.filter((s) => {
     const name = (s.full_name || '').toLowerCase();
     const sId = (s.student_id || '').toLowerCase();
     const q = searchQuery.toLowerCase();
     return name.includes(q) || sId.includes(q);
   });
+
+  const totalStudentPages = Math.ceil(filteredStudents.length / STUDENTS_PAGE_SIZE) || 1;
+  const paginatedStudents = filteredStudents.slice((studentPage - 1) * STUDENTS_PAGE_SIZE, studentPage * STUDENTS_PAGE_SIZE);
 
   const totalEvents = summaryData.events.length;
   const attendedCount = summaryData.events.filter((evt) => {
@@ -103,9 +112,16 @@ export default function StudentSummaryTab({ currentUser }) {
   }).length;
   const absentCount = Math.max(0, totalEvents - attendedCount);
   
-  const totalUnpaidFines = summaryData.fines
-    .filter((f) => String(f.status || '').toLowerCase() === 'unpaid' || String(f.status || '').toLowerCase() === 'pending_approval')
-    .reduce((acc, curr) => acc + (parseFloat(curr.amount) || 0), 0);
+  // 🚀 Robust Fine Calculation (ini-handle din ang null/empty statuses)
+  const totalUnpaidFines = (summaryData.fines || []).reduce((acc, curr) => {
+    const amt = parseFloat(curr.amount) || 0;
+    const st = String(curr.status || '').toLowerCase();
+    
+    if (!curr.status || st === '' || st === 'unpaid' || st === 'pending_approval' || st === 'pending') {
+      return acc + amt;
+    }
+    return acc;
+  }, 0);
 
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', fontFamily: 'sans-serif' }}>
@@ -134,23 +150,24 @@ export default function StudentSummaryTab({ currentUser }) {
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(12, minmax(0, 1fr))', gap: '24px', alignItems: 'start' }}>
-        {/* Left List */}
+        {/* Left List with Pagination */}
         <div style={{ gridColumn: 'span 4 / span 4', backgroundColor: '#ffffff', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.02)', display: 'flex', flexDirection: 'column', height: '700px', overflow: 'hidden' }}>
-          <div style={{ padding: '16px', borderBottom: '1px solid #f1f5f9', backgroundColor: '#f8fafc' }}>
+          <div style={{ padding: '16px', borderBottom: '1px solid #f1f5f9', backgroundColor: '#f8fafc', position: 'relative' }}>
             <input
               type="text"
               placeholder="Search BSCE student name or ID..."
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              style={{ width: '100%', padding: '9px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', boxSizing: 'border-box', outline: 'none' }}
+              onChange={(e) => { setSearchQuery(e.target.value); setStudentPage(1); }}
+              style={{ width: '100%', padding: '9px 12px 9px 34px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', boxSizing: 'border-box', outline: 'none' }}
             />
+            <Search size={14} color="#94a3b8" style={{ position: 'absolute', left: '26px', top: '50%', transform: 'translateY(-50%)' }} />
           </div>
 
           <div style={{ overflowY: 'auto', flex: 1 }}>
-            {filteredStudents.length === 0 ? (
+            {paginatedStudents.length === 0 ? (
               <div style={{ padding: '32px', textAlign: 'center', fontSize: '11px', fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase' }}>No BSCE students found</div>
             ) : (
-              filteredStudents.map((stu) => {
+              paginatedStudents.map((stu) => {
                 const isSelected = selectedStudent?.id === stu.id;
                 return (
                   <button
@@ -185,6 +202,27 @@ export default function StudentSummaryTab({ currentUser }) {
                 );
               })
             )}
+          </div>
+
+          {/* Student List Pagination Bar */}
+          <div style={{ padding: '12px 16px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f8fafc' }}>
+            <button
+              onClick={() => setStudentPage(prev => Math.max(prev - 1, 1))}
+              disabled={studentPage === 1}
+              style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: studentPage === 1 ? '#f1f5f9' : '#fff', color: studentPage === 1 ? '#94a3b8' : '#334155', fontSize: '11px', fontWeight: '700', cursor: studentPage === 1 ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+            >
+              <ChevronLeft size={14} /> Prev
+            </button>
+            <span style={{ fontSize: '11px', fontWeight: '700', color: '#64748b' }}>
+              Page {studentPage} of {totalStudentPages}
+            </span>
+            <button
+              onClick={() => setStudentPage(prev => Math.min(prev + 1, totalStudentPages))}
+              disabled={studentPage >= totalStudentPages}
+              style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: studentPage >= totalStudentPages ? '#f1f5f9' : '#fff', color: studentPage >= totalStudentPages ? '#94a3b8' : '#334155', fontSize: '11px', fontWeight: '700', cursor: studentPage >= totalStudentPages ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+            >
+              Next <ChevronRight size={14} />
+            </button>
           </div>
         </div>
 

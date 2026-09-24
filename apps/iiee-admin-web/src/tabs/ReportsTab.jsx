@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { supabase } from '../services/supabase';
+import { supabase } from '../services/supabase'; // Main FCO database for profiles
+import { attendanceClient } from '../lib/attendanceClient'; // Secondary database for IIEE tables
 
 const iieeLogoUrl = '/IIEE-BG.png';
 const essuLogoUrl = '/essu-logo-mini.png';
@@ -30,7 +31,8 @@ export default function ReportsTab({ currentUser }) {
   useEffect(() => {
     fetchReportData();
 
-    const channel = supabase
+    // Realtime synchronization via attendanceClient for IIEE secondary tables
+    const channel = attendanceClient
       .channel('realtime_iiee_reports_master_sync')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'iiee_attendance' }, () => fetchReportData())
       .on('postgres_changes', { event: '*', schema: 'public', table: 'iiee_fines' }, () => fetchReportData())
@@ -38,16 +40,16 @@ export default function ReportsTab({ currentUser }) {
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      attendanceClient.removeChannel(channel);
     };
   }, [selectedEventId, semesterFilter]);
 
- const fetchReportData = async () => {
+  const fetchReportData = async () => {
     try {
       setLoading(true);
 
-      // 1. Construct events query builder using '*'
-      let eventsQuery = supabase
+      // 1. Construct events query via attendanceClient
+      let eventsQuery = attendanceClient
         .from('iiee_events')
         .select('*')
         .order('start_time', { ascending: false });
@@ -56,8 +58,8 @@ export default function ReportsTab({ currentUser }) {
         eventsQuery = eventsQuery.eq('semester', semesterFilter);
       }
 
-      // 2. Base attendance query builder using '*' to prevent column 400 errors
-      let attendanceQuery = supabase
+      // 2. Base attendance query via attendanceClient
+      let attendanceQuery = attendanceClient
         .from('iiee_attendance')
         .select('*');
 
@@ -65,7 +67,12 @@ export default function ReportsTab({ currentUser }) {
         attendanceQuery = attendanceQuery.eq('event_id', selectedEventId);
       }
 
-      // Execute all Supabase network calls in parallel using '*'
+      // 3. Fines query via attendanceClient
+      let finesQuery = attendanceClient
+        .from('iiee_fines')
+        .select('*');
+
+      // Execute network calls across main and secondary databases in parallel
       const [evRes, stRes, attRes, fnRes] = await Promise.all([
         eventsQuery,
         supabase
@@ -74,9 +81,7 @@ export default function ReportsTab({ currentUser }) {
           .or('course.ilike.%BSEE%,course.ilike.%ELECTRICAL%')
           .order('full_name', { ascending: true }),
         attendanceQuery,
-        supabase
-          .from('iiee_fines')
-          .select('*')
+        finesQuery
       ]);
 
       setEvents(evRes.data || []);
@@ -107,8 +112,8 @@ export default function ReportsTab({ currentUser }) {
     }
   };
 
-  // Compile Comprehensive Attendance and Fine Audit Rows (Single Declaration)
- const compiledRows = students.map((student) => {
+  // Compile Comprehensive Attendance and Fine Audit Rows
+  const compiledRows = students.map((student) => {
     const relevantEvents = selectedEventId === 'ALL'
       ? events
       : events.filter((e) => String(e.id) === String(selectedEventId));

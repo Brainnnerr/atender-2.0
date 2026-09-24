@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { supabase, PICE_ORG_ID } from '../services/supabase';
+import { supabase } from '../services/supabase'; // Main FCO database for student profiles
+import { piceClient, PICE_ORG_ID } from '../services/piceClient'; // Secondary database for PICE tables
 import { 
   CheckCircle2, 
   AlertTriangle, 
@@ -9,11 +10,12 @@ import {
   X, 
   Calendar, 
   Eye, 
-  Download, 
-  CheckCircle,
-  DollarSign
+  Download,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 
+const piceLogoUrl = '/PICE-LOGO-BG.png';
 const essuLogoUrl = '/essu-logo-mini.png';
 
 export default function FineManagementTab({ currentUser }) {
@@ -26,7 +28,11 @@ export default function FineManagementTab({ currentUser }) {
   const [programFilter, setProgramFilter] = useState('ALL');
   const [yearFilter, setYearFilter] = useState('ALL');
   const [sectionFilter, setSectionFilter] = useState('ALL');
-  const [semesterFilter, setSemesterFilter] = useState('1st Semester'); // Default to 1st Semester
+  const [semesterFilter, setSemesterFilter] = useState('1st Semester');
+
+  // Pagination states (10 items per page)
+  const [currentPage, setCurrentPage] = useState(1);
+  const pageSize = 10;
 
   const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
   
@@ -41,51 +47,52 @@ export default function FineManagementTab({ currentUser }) {
   const [selectedRemark, setSelectedRemark] = useState('Member');
 
   useEffect(() => {
+    setCurrentPage(1);
     fetchStudentFinesMasterlist();
-  }, [semesterFilter]); // Re-fetch or re-filter when semester changes
+  }, [semesterFilter]);
 
   const showToast = (message, type = 'success') => {
     setToast({ show: true, message, type });
     setTimeout(() => setToast({ show: false, message: '', type: 'success' }), 3500);
   };
 
-
   const fetchStudentFinesMasterlist = async () => {
     try {
       setLoading(true);
       
-      // 1. Fetch Students (BSCE for PICE, BSEE for IIEE)
-      const { data: students, error: studErr } = await supabase
-        .from('profiles')
-        .select('id, full_name, student_id, year_level, section, course')
-        .or('course.ilike.%BSCE%,course.ilike.%CIVIL%'); // Use BSEE/ELECTRICAL for IIEE
+      const [studRes, evRes, attRes, fineRes] = await Promise.all([
+        supabase
+          .from('profiles')
+          .select('id, full_name, student_id, year_level, section, course')
+          .or('course.ilike.%BSCE%,course.ilike.%CIVIL%'),
 
-      if (studErr) throw studErr;
+        piceClient
+          .from('pice_events')
+          .select('id, title, end_time, fine_amount, semester')
+          .eq('organization_id', PICE_ORG_ID),
 
-      // 2. FETCH STRICTLY SUB-ORG EVENTS (pice_events only!)
-      const { data: eventsData, error: evErr } = await supabase
-        .from('pice_events') // use 'iiee_events' for IIEE
-        .select('id, title, end_time, fine_amount, semester')
-        .eq('organization_id', PICE_ORG_ID); // use IIEE_ORG_ID for IIEE
+        piceClient
+          .from('pice_attendance')
+          .select('student_id, event_id, time_in, status'),
 
-      if (evErr) throw evErr;
+        piceClient
+          .from('pice_fines')
+          .select('id, amount, status, remarks, student_id, event_id')
+          .eq('organization_id', PICE_ORG_ID)
+      ]);
 
-      // 3. FETCH STRICTLY SUB-ORG ATTENDANCE (pice_attendance only!)
-      const { data: attData, error: attErr } = await supabase
-        .from('pice_attendance') // use 'iiee_attendance' for IIEE
-        .select('student_id, event_id, time_in, status');
+      if (studRes.error) throw studRes.error;
+      if (evRes.error) throw evRes.error;
+      if (attRes.error) throw attRes.error;
+      if (fineRes.error) throw fineRes.error;
 
-      if (attErr) throw attErr;
+      const students = studRes.data || [];
+      const eventsData = evRes.data || [];
+      const attData = attRes.data || [];
+      const finesData = fineRes.data || [];
 
-      // 4. FETCH STRICTLY SUB-ORG FINES (pice_fines only! NEVER touches 'fines')
-      const { data: finesData, error: fineErr } = await supabase
-        .from('pice_fines') // use 'iiee_fines' for IIEE
-        .select('id, amount, status, remarks, student_id, event_id');
-
-      if (fineErr) throw fineErr;
-
-      const aggregatedList = (students || []).map(student => {
-        const semesterEvents = (eventsData || []).filter(evt => {
+      const aggregatedList = students.map(student => {
+        const semesterEvents = eventsData.filter(evt => {
           if (semesterFilter === 'ALL') return true;
           const sem = evt.semester || '1st Semester';
           return sem.toLowerCase() === semesterFilter.toLowerCase();
@@ -100,13 +107,13 @@ export default function FineManagementTab({ currentUser }) {
 
         semesterEvents.forEach(evt => {
           const isClosed = new Date(evt.end_time).getTime() <= Date.now();
-          const hasAttended = (attData || []).some(a => 
+          const hasAttended = attData.some(a => 
             String(a.student_id) === String(student.id) && 
             String(a.event_id) === String(evt.id) && 
             (a.time_in || a.status === 'present')
           );
 
-          const existingFine = (finesData || []).find(f => 
+          const existingFine = finesData.find(f => 
             String(f.student_id) === String(student.id) && 
             String(f.event_id) === String(evt.id)
           );
@@ -115,7 +122,9 @@ export default function FineManagementTab({ currentUser }) {
 
           if (existingFine) {
             studentFineIds.push(existingFine.id);
-            if (existingFine.remarks) studentRemarks = existingFine.remarks;
+            if (existingFine.remarks && existingFine.remarks !== 'Admin Rejected Attendance Proof') {
+              studentRemarks = existingFine.remarks;
+            }
             
             const statusStr = String(existingFine.status || '').toLowerCase();
             if (statusStr === 'paid') {
@@ -161,7 +170,6 @@ export default function FineManagementTab({ currentUser }) {
       setLoading(false);
     }
   };
-  
 
   const handleOpenRemarksModal = (studentRecord) => {
     if (parseFloat(studentRecord.unpaidAmount || 0) <= 0) return;
@@ -175,35 +183,22 @@ export default function FineManagementTab({ currentUser }) {
 
     try {
       const studentId = selectedStudentForAction.studentId;
-      const missedEvents = selectedStudentForAction.missedEvents || [];
+      const semesterEvents = selectedStudentForAction.missedEvents || [];
 
-      const upsertPayloads = missedEvents.map(eventId => ({
-        student_id: studentId,
-        event_id: eventId,
-        amount: 50.00,
-        status: 'paid',
-        remarks: selectedRemark,
-        organization_id: PICE_ORG_ID
-      }));
-
-      if (upsertPayloads.length > 0) {
-        const { error: upsertErr } = await supabase
+      // 🚀 Siguruhing lahat ng missed/unpaid events ng estudyante ay mase-save bilang 'paid' sa pice_fines
+      for (const eventId of semesterEvents) {
+        const { error: upsertErr } = await piceClient
           .from('pice_fines')
-          .upsert(upsertPayloads, { onConflict: 'student_id,event_id' });
+          .upsert({
+            student_id: studentId,
+            event_id: eventId,
+            amount: 50.00,
+            status: 'paid',
+            remarks: selectedRemark,
+            organization_id: PICE_ORG_ID
+          }, { onConflict: 'student_id,event_id' });
 
-        if (upsertErr) {
-          await supabase
-            .from('pice_fines')
-            .update({ status: 'paid', remarks: selectedRemark })
-            .eq('student_id', studentId);
-        }
-      } else {
-        const { error } = await supabase
-          .from('pice_fines')
-          .update({ status: 'paid', remarks: selectedRemark })
-          .eq('student_id', studentId);
-
-        if (error) throw error;
+        if (upsertErr) throw upsertErr;
       }
 
       showToast('PICE fines successfully marked as paid!');
@@ -235,6 +230,10 @@ export default function FineManagementTab({ currentUser }) {
     return matchesSearch && matchesStatus && matchesProgram && matchesYear && matchesSection;
   });
 
+  const totalPages = Math.ceil(filteredFines.length / pageSize) || 1;
+  const startIndex = (currentPage - 1) * pageSize;
+  const paginatedFines = filteredFines.slice(startIndex, startIndex + pageSize);
+
   const totalUnpaidAmount = filteredFines
     .filter(f => f.status === 'unpaid')
     .reduce((sum, f) => sum + parseFloat(f.unpaidAmount || 0), 0);
@@ -263,12 +262,21 @@ export default function FineManagementTab({ currentUser }) {
     const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
     const pageWidth = doc.internal.pageSize.getWidth();
 
+    const base64Pice = await getBase64ImageFromUrl(piceLogoUrl);
+    if (base64Pice) {
+      try {
+        doc.addImage(base64Pice, 'PNG', 45, 34, 46, 46);
+      } catch (imgErr) {
+        console.warn('Could not render PICE logo on PDF:', imgErr);
+      }
+    }
+
     const base64Essu = await getBase64ImageFromUrl(essuLogoUrl);
     if (base64Essu) {
       try {
         doc.addImage(base64Essu, 'PNG', pageWidth - 45 - 46, 34, 46, 46);
       } catch (imgErr) {
-        console.warn('Could not render logo on PDF:', imgErr);
+        console.warn('Could not render ESSU logo on PDF:', imgErr);
       }
     }
 
@@ -279,7 +287,7 @@ export default function FineManagementTab({ currentUser }) {
 
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(8.5);
-    doc.setTextColor(30, 58, 138);
+    doc.setTextColor(15, 23, 42);
     doc.text('ESSU STUDENT CHAPTER • COLLEGE OF ENGINEERING', pageWidth / 2, 60, { align: 'center' });
 
     doc.setFont('helvetica', 'bold');
@@ -378,7 +386,6 @@ export default function FineManagementTab({ currentUser }) {
 
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', fontFamily: 'sans-serif' }}>
-      {/* Toast Notification */}
       {toast.show && (
         <div style={{ position: 'fixed', top: '24px', right: '24px', zIndex: 9999 }}>
           <div style={{
@@ -453,7 +460,7 @@ export default function FineManagementTab({ currentUser }) {
             type="text"
             placeholder="Search BSCE student name or ID..."
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => { setSearchQuery(e.target.value); setCurrentPage(1); }}
             style={{ width: '100%', padding: '9px 12px 9px 34px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', boxSizing: 'border-box', outline: 'none' }}
           />
           <Search size={14} color="#94a3b8" style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)' }} />
@@ -462,7 +469,7 @@ export default function FineManagementTab({ currentUser }) {
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
           <select
             value={programFilter}
-            onChange={(e) => setProgramFilter(e.target.value)}
+            onChange={(e) => { setProgramFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Program: All</option>
@@ -473,7 +480,7 @@ export default function FineManagementTab({ currentUser }) {
 
           <select
             value={yearFilter}
-            onChange={(e) => setYearFilter(e.target.value)}
+            onChange={(e) => { setYearFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Year: All</option>
@@ -484,7 +491,7 @@ export default function FineManagementTab({ currentUser }) {
 
           <select
             value={sectionFilter}
-            onChange={(e) => setSectionFilter(e.target.value)}
+            onChange={(e) => { setSectionFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Section: All</option>
@@ -495,7 +502,7 @@ export default function FineManagementTab({ currentUser }) {
 
           <select
             value={semesterFilter}
-            onChange={(e) => setSemesterFilter(e.target.value)}
+            onChange={(e) => { setSemesterFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="1st Semester">1st Semester</option>
@@ -508,7 +515,7 @@ export default function FineManagementTab({ currentUser }) {
             {['ALL', 'UNPAID', 'PAID'].map((st) => (
               <button
                 key={st}
-                onClick={() => setStatusFilter(st)}
+                onClick={() => { setStatusFilter(st); setCurrentPage(1); }}
                 style={{
                   padding: '5px 10px',
                   borderRadius: '6px',
@@ -528,83 +535,106 @@ export default function FineManagementTab({ currentUser }) {
         </div>
       </div>
 
-      {/* FINES TABLE */}
+      {/* FINES TABLE WITH PAGINATION */}
       <div style={{ backgroundColor: '#ffffff', borderRadius: '16px', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
         {loading ? (
           <div style={{ padding: '48px', textAlign: 'center', fontSize: '11px', fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase' }}>
             Loading BSCE student masterlist for {semesterFilter}...
           </div>
         ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '12px' }}>
-              <thead>
-                <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', fontSize: '11px', color: '#64748b', textTransform: 'uppercase' }}>
-                  <th style={{ padding: '14px 20px' }}>BSCE Student Info</th>
-                  <th style={{ padding: '14px 20px' }}>Remarks</th>
-                  <th style={{ padding: '14px 20px' }}>Amount ({semesterFilter})</th>
-                  <th style={{ padding: '14px 20px' }}>Payment Status</th>
-                  <th style={{ padding: '14px 20px', textAlign: 'right' }}>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredFines.length === 0 ? (
-                  <tr>
-                    <td colSpan="5" style={{ padding: '48px', textAlign: 'center', color: '#94a3b8', fontWeight: '700', textTransform: 'uppercase' }}>
-                      No BSCE student records found matching your filters for {semesterFilter}.
-                    </td>
+          <div>
+            <div style={{ overflowX: 'auto', minHeight: '380px' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '12px' }}>
+                <thead>
+                  <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', fontSize: '11px', color: '#64748b', textTransform: 'uppercase' }}>
+                    <th style={{ padding: '14px 20px' }}>BSCE Student Info</th>
+                    <th style={{ padding: '14px 20px' }}>Remarks</th>
+                    <th style={{ padding: '14px 20px' }}>Amount ({semesterFilter})</th>
+                    <th style={{ padding: '14px 20px' }}>Payment Status</th>
+                    <th style={{ padding: '14px 20px', textAlign: 'right' }}>Action</th>
                   </tr>
-                ) : (
-                  filteredFines.map((f) => {
-                    const student = f.profiles || {};
-                    const isPaid = f.status === 'paid';
-                    const amountVal = parseFloat(f.status === 'unpaid' ? f.unpaidAmount : f.amount || 0);
+                </thead>
+                <tbody>
+                  {paginatedFines.length === 0 ? (
+                    <tr>
+                      <td colSpan="5" style={{ padding: '48px', textAlign: 'center', color: '#94a3b8', fontWeight: '700', textTransform: 'uppercase' }}>
+                        No BSCE student records found matching your filters for {semesterFilter}.
+                      </td>
+                    </tr>
+                  ) : (
+                    paginatedFines.map((f) => {
+                      const student = f.profiles || {};
+                      const isPaid = f.status === 'paid';
+                      const amountVal = parseFloat(f.status === 'unpaid' ? f.unpaidAmount : f.amount || 0);
 
-                    return (
-                      <tr key={f.studentId} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                        <td style={{ padding: '14px 20px' }}>
-                          <p style={{ fontWeight: '700', color: '#0f172a', margin: '0 0 2px 0' }}>{student.full_name || 'Unknown'}</p>
-                          <p style={{ fontSize: '11px', color: '#64748b', margin: 0, fontFamily: 'monospace' }}>ID: {student.student_id || 'N/A'} • {student.course || 'BSCE'} {student.year_level}{student.section}</p>
-                        </td>
-                        <td style={{ padding: '14px 20px' }}>
-                          <span style={{ padding: '3px 8px', backgroundColor: '#f1f5f9', color: '#334155', borderRadius: '6px', fontSize: '10px', fontWeight: '700', textTransform: 'uppercase' }}>
-                            {f.remarks || 'Member'}
-                          </span>
-                        </td>
-                        <td style={{ padding: '14px 20px', fontWeight: '900', fontFamily: 'monospace', color: '#0f172a' }}>
-                          ₱{amountVal.toFixed(2)}
-                        </td>
-                        <td style={{ padding: '14px 20px' }}>
-                          <span style={{
-                            padding: '4px 10px',
-                            borderRadius: '20px',
-                            fontSize: '10px',
-                            fontWeight: '900',
-                            textTransform: 'uppercase',
-                            backgroundColor: isPaid ? '#ecfdf5' : '#fef2f2',
-                            color: isPaid ? '#059669' : '#dc2626',
-                            border: `1px solid ${isPaid ? '#a7f3d0' : '#fecaca'}`
-                          }}>
-                            {f.status.toUpperCase()}
-                          </span>
-                        </td>
-                        <td style={{ padding: '14px 20px', textAlign: 'right' }}>
-                          {f.unpaidAmount > 0 ? (
-                            <button
-                              onClick={() => handleOpenRemarksModal(f)}
-                              style={{ backgroundColor: '#059669', color: '#ffffff', border: 'none', padding: '6px 14px', borderRadius: '8px', fontWeight: '700', fontSize: '11px', cursor: 'pointer', textTransform: 'uppercase' }}
-                            >
-                              Mark Paid ✓
-                            </button>
-                          ) : (
-                            <span style={{ color: '#cbd5e1', fontWeight: '700', fontSize: '10px', textTransform: 'uppercase' }}>No Balance</span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
+                      return (
+                        <tr key={f.studentId} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                          <td style={{ padding: '14px 20px' }}>
+                            <p style={{ fontWeight: '700', color: '#0f172a', margin: '0 0 2px 0' }}>{student.full_name || 'Unknown'}</p>
+                            <p style={{ fontSize: '11px', color: '#64748b', margin: 0, fontFamily: 'monospace' }}>ID: {student.student_id || 'N/A'} • {student.course || 'BSCE'} {student.year_level}{student.section}</p>
+                          </td>
+                          <td style={{ padding: '14px 20px' }}>
+                            <span style={{ padding: '3px 8px', backgroundColor: '#f1f5f9', color: '#334155', borderRadius: '6px', fontSize: '10px', fontWeight: '700', textTransform: 'uppercase' }}>
+                              {f.remarks || 'Member'}
+                            </span>
+                          </td>
+                          <td style={{ padding: '14px 20px', fontWeight: '900', fontFamily: 'monospace', color: '#0f172a' }}>
+                            ₱{amountVal.toFixed(2)}
+                          </td>
+                          <td style={{ padding: '14px 20px' }}>
+                            <span style={{
+                              padding: '4px 10px',
+                              borderRadius: '20px',
+                              fontSize: '10px',
+                              fontWeight: '900',
+                              textTransform: 'uppercase',
+                              backgroundColor: isPaid ? '#ecfdf5' : '#fef2f2',
+                              color: isPaid ? '#059669' : '#dc2626',
+                              border: `1px solid ${isPaid ? '#a7f3d0' : '#fecaca'}`
+                            }}>
+                              {f.status.toUpperCase()}
+                            </span>
+                          </td>
+                          <td style={{ padding: '14px 20px', textAlign: 'right' }}>
+                            {f.unpaidAmount > 0 ? (
+                              <button
+                                onClick={() => handleOpenRemarksModal(f)}
+                                style={{ backgroundColor: '#059669', color: '#ffffff', border: 'none', padding: '6px 14px', borderRadius: '8px', fontWeight: '700', fontSize: '11px', cursor: 'pointer', textTransform: 'uppercase' }}
+                              >
+                                Mark Paid ✓
+                              </button>
+                            ) : (
+                              <span style={{ color: '#cbd5e1', fontWeight: '700', fontSize: '10px', textTransform: 'uppercase' }}>No Balance</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* PAGINATION CONTROLS */}
+            <div style={{ padding: '12px 20px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f8fafc' }}>
+              <button
+                onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+                disabled={currentPage === 1}
+                style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: '#ffffff', fontSize: '11px', fontWeight: '700', cursor: currentPage === 1 ? 'not-allowed' : 'pointer', opacity: currentPage === 1 ? 0.4 : 1, display: 'flex', alignItems: 'center', gap: '4px', color: '#334155' }}
+              >
+                <ChevronLeft size={14} /> Prev
+              </button>
+              <span style={{ fontSize: '11px', fontWeight: '700', color: '#475569' }}>
+                Page {currentPage} of {totalPages || 1}
+              </span>
+              <button
+                onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
+                disabled={currentPage === totalPages || totalPages === 0}
+                style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: '#ffffff', fontSize: '11px', fontWeight: '700', cursor: (currentPage === totalPages || totalPages === 0) ? 'not-allowed' : 'pointer', opacity: (currentPage === totalPages || totalPages === 0) ? 0.4 : 1, display: 'flex', alignItems: 'center', gap: '4px', color: '#334155' }}
+              >
+                Next <ChevronRight size={14} />
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -663,7 +693,7 @@ export default function FineManagementTab({ currentUser }) {
               </div>
               <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
                 <button onClick={handleDownloadPDF} style={{ backgroundColor: '#b45309', color: '#ffffff', border: 'none', padding: '8px 16px', borderRadius: '8px', fontWeight: '800', fontSize: '11px', textTransform: 'uppercase', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <Download size={14} /> Save PDF
+                  <Download size={14} /> Save PDF Report
                 </button>
                 <button onClick={() => setPdfPreviewModalOpen(false)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#64748b' }}><X size={20} /></button>
               </div>

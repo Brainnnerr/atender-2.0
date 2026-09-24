@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
-import { supabase, PICE_ORG_ID } from '../services/supabase';
+import { supabase } from '../services/supabase'; // Main FCO database for profiles
+import { piceClient, PICE_ORG_ID } from '../services/piceClient'; // Secondary database for PICE tables
 import { QrCode, PlusCircle, Search, Calendar, MapPin, Clock, AlertTriangle, ShieldAlert, CheckCircle2 } from 'lucide-react';
 
 export default function EventsTab() {
@@ -61,30 +62,71 @@ export default function EventsTab() {
   const fetchEvents = async () => {
     try {
       setLoading(true);
-      const { data, error } = await supabase
+      // 1. Fetch PICE Events from secondary DB
+      const { data: eventsData, error } = await piceClient
         .from('pice_events')
         .select('*')
         .eq('organization_id', PICE_ORG_ID)
         .order('start_time', { ascending: false });
 
       if (error) throw error;
-      setEvents(data || []);
+      setEvents(eventsData || []);
 
-      if (data) {
-        for (const evt of data) {
+      // 2. Client-side automated fine generation for expired/past events (Exact IIEE Equivalent Logic)
+      if (eventsData && eventsData.length > 0) {
+        // Fetch all student profiles from main FCO database
+        const { data: studentsData } = await supabase
+          .from('profiles')
+          .select('id, course');
+
+        // Filter students belonging to PICE (BSCE / Civil Engineering)
+        const piceStudents = (studentsData || []).filter(s => {
+          const c = (s.course || '').toUpperCase();
+          return c.includes('BSCE') || c.includes('CIVIL');
+        });
+
+        for (const evt of eventsData) {
           const now = new Date().getTime();
           const end = new Date(evt.end_time).getTime();
+
+          // Check if event has ended or was created in the past
           if (now > end) {
-            try {
-              await supabase.rpc('generate_pice_expired_event_fines', { p_event_id: evt.id });
-            } catch (rpcErr) {
-              console.log('Fine generation background check error:', rpcErr);
+            // Fetch existing attendance for this event
+            const { data: attData } = await piceClient
+              .from('pice_attendance')
+              .select('student_id')
+              .eq('event_id', evt.id);
+
+            const attendedStudentIds = new Set((attData || []).map(a => a.student_id));
+
+            // Fetch existing fines for this event
+            const { data: finesData } = await piceClient
+              .from('pice_fines')
+              .select('student_id')
+              .eq('event_id', evt.id);
+
+            const finedStudentIds = new Set((finesData || []).map(f => f.student_id));
+
+            // Identify absentees who don't have a fine yet and insert them into pice_fines
+            for (const student of piceStudents) {
+              if (!attendedStudentIds.has(student.id) && !finedStudentIds.has(student.id)) {
+                await piceClient
+                  .from('pice_fines')
+                  .insert([{
+                    event_id: evt.id,
+                    student_id: student.id,
+                    amount: evt.fine_amount || 50.00,
+                    status: 'unpaid',
+                    remarks: 'Member (Auto-Generated)',
+                    organization_id: PICE_ORG_ID
+                  }]);
+              }
             }
           }
         }
       }
     } catch (err) {
-      console.error('Error fetching PICE events:', err);
+      console.error('Error fetching PICE events or generating fines:', err);
       showToast('Failed to load PICE events.', 'error');
     } finally {
       setLoading(false);
@@ -184,7 +226,7 @@ export default function EventsTab() {
       };
 
       if (isEditing) {
-        const { error } = await supabase
+        const { error } = await piceClient
           .from('pice_events')
           .update(payload)
           .eq('id', selectedEventId)
@@ -193,7 +235,7 @@ export default function EventsTab() {
         if (error) throw error;
         showToast(`PICE Event "${title}" updated successfully!`);
       } else {
-        const { error } = await supabase
+        const { error } = await piceClient
           .from('pice_events')
           .insert([payload]);
 
@@ -214,14 +256,14 @@ export default function EventsTab() {
     try {
       showToast('Checking event records...', 'success');
 
-      const { count: attendanceCount, error: attErr } = await supabase
+      const { count: attendanceCount, error: attErr } = await piceClient
         .from('pice_attendance')
         .select('*', { count: 'exact', head: true })
         .eq('event_id', event.id);
 
       if (attErr) throw attErr;
 
-      const { count: finesCount, error: finesErr } = await supabase
+      const { count: finesCount, error: finesErr } = await piceClient
         .from('pice_fines')
         .select('*', { count: 'exact', head: true })
         .eq('event_id', event.id);
@@ -249,7 +291,7 @@ export default function EventsTab() {
 
     setDeleting(true);
     try {
-      const { error } = await supabase
+      const { error } = await piceClient
         .from('pice_events')
         .delete()
         .eq('id', eventToDelete.id)
@@ -647,7 +689,7 @@ export default function EventsTab() {
                 />
               </div>
 
-              {/* Geofencing Configuration */}
+              {/* Geofencing Configuration Block */}
               <div style={{ backgroundColor: '#f8fafc', padding: '16px', borderRadius: '12px', border: '1px solid #e2e8f0', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span style={{ fontSize: '11px', fontWeight: '700', color: '#334155', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Geofencing & GPS</span>

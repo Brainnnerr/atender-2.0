@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { supabase, IIEE_ORG_ID } from '../services/supabase';
-import { CheckCircle2, AlertTriangle, Camera, Search, X, ShieldAlert, Clock, UserCheck } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { supabase, IIEE_ORG_ID } from '../services/supabase'; // Corrected path
+import { attendanceClient } from '../lib/attendanceClient';
+import { CheckCircle2, AlertTriangle, Camera, Search, X, ShieldAlert, Clock, UserCheck, ChevronLeft, ChevronRight } from 'lucide-react';
 
 export default function AttendanceTab({ currentUser }) {
   const [events, setEvents] = useState([]);
@@ -10,6 +11,10 @@ export default function AttendanceTab({ currentUser }) {
   const [loading, setLoading] = useState(true);
   const [deleting, setDeleting] = useState(false);
   const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
+
+  // Pagination States (Limited to 10 per page)
+  const [currentPage, setCurrentPage] = useState(1);
+  const PAGE_SIZE = 10;
 
   // Manual Attendance Modal States
   const [manualModalOpen, setManualModalOpen] = useState(false);
@@ -33,24 +38,20 @@ export default function AttendanceTab({ currentUser }) {
   }, []);
 
   useEffect(() => {
+    setCurrentPage(1); // Reset to page 1 on event filter change
     fetchAttendanceData();
 
-    const channel = supabase
+    const channel = attendanceClient
       .channel('realtime_iiee_admin_sync')
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'iiee_attendance' },
         () => fetchAttendanceData()
       )
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'profiles' },
-        () => fetchAttendanceData()
-      )
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      attendanceClient.removeChannel(channel);
     };
   }, [selectedEventId]);
 
@@ -63,7 +64,7 @@ export default function AttendanceTab({ currentUser }) {
 
   const fetchEventsList = async () => {
     try {
-      const { data, error } = await supabase
+      const { data, error } = await attendanceClient
         .from('iiee_events')
         .select('id, title, start_time, end_time, fine_amount')
         .eq('organization_id', IIEE_ORG_ID)
@@ -95,48 +96,58 @@ export default function AttendanceTab({ currentUser }) {
     }
   };
 
- const fetchAttendanceData = async () => {
+  const fetchAttendanceData = async () => {
     try {
       setLoading(true);
 
-      // Fetch IIEE attendance, profiles, and events in ONE optimized database query
-      let attQuery = supabase
+      let attQuery = attendanceClient
         .from('iiee_attendance')
         .select(`
           id,
+          event_id,
+          student_id,
           time_in,
           time_out,
           created_at,
-          proof_photo_url,
-          profiles (
-            id,
-            full_name,
-            student_id,
-            course,
-            year_level,
-            section,
-            avatar_url
-          ),
-          iiee_events (
-            id,
-            title,
-            fine_amount
-          )
+          proof_photo_url
         `)
-        .order('time_in', { ascending: false })
-        .limit(500); // Safety limit to prevent crashing on "ALL" events
+        .order('time_in', { ascending: false });
 
       if (selectedEventId && selectedEventId !== 'ALL') {
         attQuery = attQuery.eq('event_id', selectedEventId);
       }
 
-      const { data, error } = await attQuery;
-      if (error) throw error;
+      const { data: attData, error: attErr } = await attQuery;
+      if (attErr) throw attErr;
 
-      // Map 'iiee_events' to 'events' so your UI components don't break
-      const formattedData = (data || []).map(item => ({
+      if (!attData || attData.length === 0) {
+        setAttendanceLogs([]);
+        setSelectedLog(null);
+        setLoading(false);
+        return;
+      }
+
+      const studentIds = [...new Set(attData.map(a => a.student_id))];
+      const eventIds = [...new Set(attData.map(a => a.event_id))];
+
+      const [profilesRes, eventsRes] = await Promise.all([
+        supabase
+          .from('profiles')
+          .select('id, full_name, student_id, course, year_level, section, avatar_url')
+          .in('id', studentIds),
+        attendanceClient
+          .from('iiee_events')
+          .select('id, title, fine_amount')
+          .in('id', eventIds)
+      ]);
+
+      const profileMap = new Map((profilesRes.data || []).map(p => [p.id, p]));
+      const eventMap = new Map((eventsRes.data || []).map(e => [e.id, e]));
+
+      const formattedData = attData.map(item => ({
         ...item,
-        events: item.iiee_events
+        profiles: profileMap.get(item.student_id) || null,
+        events: eventMap.get(item.event_id) || null
       }));
 
       setAttendanceLogs(formattedData);
@@ -165,7 +176,7 @@ export default function AttendanceTab({ currentUser }) {
 
     setManualSubmitting(true);
     try {
-      const { error } = await supabase.rpc('admin_override_iiee_attendance_present', {
+      const { error } = await attendanceClient.rpc('admin_override_iiee_attendance_present', {
         p_event_id: manualEventId,
         p_student_id: manualStudentId,
       });
@@ -200,7 +211,7 @@ export default function AttendanceTab({ currentUser }) {
 
     try {
       setDeleting(true);
-      const { data: res, error } = await supabase.rpc('admin_invalidate_iiee_attendance', {
+      const { data: res, error } = await attendanceClient.rpc('admin_invalidate_iiee_attendance', {
         p_attendance_id: log.id,
       });
 
@@ -233,6 +244,9 @@ export default function AttendanceTab({ currentUser }) {
     return matchesSearch && matchesProgram && matchesYear && matchesSection;
   });
 
+  const totalPages = Math.ceil(filteredLogs.length / PAGE_SIZE) || 1;
+  const paginatedLogs = filteredLogs.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+
   const filteredModalStudents = students.filter((stu) => {
     const name = (stu.full_name || '').toLowerCase();
     const sId = (stu.student_id || '').toLowerCase();
@@ -242,7 +256,6 @@ export default function AttendanceTab({ currentUser }) {
 
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', fontFamily: 'sans-serif' }}>
-      {/* Toast Notification */}
       {toast.show && (
         <div style={{ position: 'fixed', top: '24px', right: '24px', zIndex: 9999 }}>
           <div style={{
@@ -282,7 +295,7 @@ export default function AttendanceTab({ currentUser }) {
         </button>
       </div>
 
-      {/* 2. FILTER AND SEARCH BAR (Dropdowns for Program, Year, Section) */}
+      {/* 2. FILTER AND SEARCH BAR */}
       <div style={{ backgroundColor: '#ffffff', padding: '16px 20px', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.02)', display: 'flex', gap: '14px', alignItems: 'center', justifyContent: 'space-between', marginBottom: '24px', flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: '220px' }}>
           <span style={{ fontSize: '11px', fontWeight: '700', color: '#64748b', textTransform: 'uppercase' }}>Event:</span>
@@ -305,27 +318,25 @@ export default function AttendanceTab({ currentUser }) {
             type="text"
             placeholder="Search BSEE student name or ID..."
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => { setSearchQuery(e.target.value); setCurrentPage(1); }}
             style={{ width: '100%', padding: '9px 12px 9px 36px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', boxSizing: 'border-box', outline: 'none', fontWeight: '400' }}
           />
           <Search size={15} color="#94a3b8" style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)' }} />
         </div>
 
-        {/* Dropdowns for Program, Year, Section */}
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
           <select
             value={programFilter}
-            onChange={(e) => setProgramFilter(e.target.value)}
+            onChange={(e) => { setProgramFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Program: All</option>
             <option value="BSEE">BSEE</option>
-            
           </select>
 
           <select
             value={yearFilter}
-            onChange={(e) => setYearFilter(e.target.value)}
+            onChange={(e) => { setYearFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Year: All</option>
@@ -337,7 +348,7 @@ export default function AttendanceTab({ currentUser }) {
 
           <select
             value={sectionFilter}
-            onChange={(e) => setSectionFilter(e.target.value)}
+            onChange={(e) => { setSectionFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Section: All</option>
@@ -363,13 +374,13 @@ export default function AttendanceTab({ currentUser }) {
             <div style={{ padding: '48px', textAlign: 'center', fontSize: '11px', fontWeight: '600', color: '#94a3b8', textTransform: 'uppercase' }}>
               Loading IIEE attendance logs...
             </div>
-          ) : filteredLogs.length === 0 ? (
+          ) : paginatedLogs.length === 0 ? (
             <div style={{ padding: '48px', textAlign: 'center', fontSize: '11px', fontWeight: '600', color: '#94a3b8', textTransform: 'uppercase' }}>
               No IIEE attendance records found.
             </div>
           ) : (
-            <div style={{ maxHeight: '580px', overflowY: 'auto' }}>
-              {filteredLogs.map((log) => {
+            <div>
+              {paginatedLogs.map((log) => {
                 const isSelected = selectedLog?.id === log.id;
                 const student = log.profiles || {};
                 const logTime = log.time_in || log.time_out || log.created_at;
@@ -413,6 +424,27 @@ export default function AttendanceTab({ currentUser }) {
               })}
             </div>
           )}
+
+          {/* Pagination Controls (10 items per page) */}
+          <div style={{ padding: '12px 16px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f8fafc' }}>
+            <button
+              onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
+              disabled={currentPage === 1}
+              style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: currentPage === 1 ? '#f1f5f9' : '#fff', color: currentPage === 1 ? '#94a3b8' : '#334155', fontSize: '11px', fontWeight: '700', cursor: currentPage === 1 ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+            >
+              <ChevronLeft size={14} /> Prev
+            </button>
+            <span style={{ fontSize: '11px', fontWeight: '700', color: '#64748b' }}>
+              Page {currentPage} of {totalPages}
+            </span>
+            <button
+              onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
+              disabled={currentPage >= totalPages}
+              style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: currentPage >= totalPages ? '#f1f5f9' : '#fff', color: currentPage >= totalPages ? '#94a3b8' : '#334155', fontSize: '11px', fontWeight: '700', cursor: currentPage >= totalPages ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+            >
+              Next <ChevronRight size={14} />
+            </button>
+          </div>
         </div>
 
         {/* RIGHT PANE: DETAIL & PHOTO PROOF DRAWER */}
@@ -460,7 +492,6 @@ export default function AttendanceTab({ currentUser }) {
                 </div>
               </div>
 
-              {/* Updated Layout: Program, Year & Sec, and Time Logged In below */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', fontSize: '12px' }}>
                 <div style={{ padding: '10px', backgroundColor: '#f8fafc', borderRadius: '10px', border: '1px solid #e2e8f0' }}>
                   <p style={{ fontSize: '10px', fontWeight: '700', color: '#64748b', textTransform: 'uppercase', margin: '0 0 2px 0' }}>Program</p>
@@ -474,7 +505,6 @@ export default function AttendanceTab({ currentUser }) {
                 </div>
               </div>
 
-              {/* Time Logged In Badge placed right below Program / Year & Sec */}
               <div style={{ padding: '10px 12px', backgroundColor: '#ecfdf5', borderRadius: '10px', border: '1px solid #a7f3d0', display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <Clock size={15} color="#059669" />
                 <div>

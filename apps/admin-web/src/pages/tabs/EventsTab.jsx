@@ -17,14 +17,14 @@ export default function EventsTab({ currentUser }) {
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
   const [currentTime, setCurrentTime] = useState(new Date());
-const [semester, setSemester] = useState('1st Semester');
+  const [semester, setSemester] = useState('1st Semester');
 
   // Secure deletion modal states
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [eventToDelete, setEventToDelete] = useState(null);
   const [deleteConfirmationText, setDeleteConfirmationText] = useState('');
   const [deleting, setDeleting] = useState(false);
-const [semesterFilter, setSemesterFilter] = useState('ALL');
+  const [semesterFilter, setSemesterFilter] = useState('ALL');
   const printRef = useRef(null);
 
   // Form states
@@ -63,13 +63,8 @@ const [semesterFilter, setSemesterFilter] = useState('ALL');
     try {
       setLoading(true);
 
-      // Automatically evaluate and generate absence fines for any expired sessions
-      try {
-        await supabase.rpc('process_expired_event_fines');
-      } catch (syncErr) {
-        console.warn('Auto-fine processing notice:', syncErr);
-      }
-
+      // --- LIGHTNING FAST OPTIMIZATION ---
+      // Fetch events instantly so the table populates without delay
       const { data, error } = await supabase
         .from('events')
         .select('*')
@@ -82,6 +77,15 @@ const [semesterFilter, setSemesterFilter] = useState('ALL');
       showToast('Failed to load events.', 'error');
     } finally {
       setLoading(false);
+    }
+
+    // Run absence fine evaluation silently in the background (non-blocking)
+    try {
+      supabase.rpc('process_expired_event_fines').catch((syncErr) => {
+        console.warn('Background auto-fine processing notice:', syncErr);
+      });
+    } catch (e) {
+      // Ignored non-blocking
     }
   };
 
@@ -380,7 +384,6 @@ const [semesterFilter, setSemesterFilter] = useState('ALL');
         </button>
       </div>
 
-      {/* 3. FILTER AND SEARCH BAR */}
       {/* 3. FILTER AND SEARCH BAR */}
       <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm flex flex-col lg:flex-row gap-4 items-center justify-between print:hidden">
         <div className="w-full lg:w-96 relative">
@@ -691,17 +694,17 @@ const [semesterFilter, setSemesterFilter] = useState('ALL');
             </div>
 
             <div>
-  <label className="block mb-1.5">Academic Semester</label>
-  <select
-    value={semester}
-    onChange={(e) => setSemester(e.target.value)}
-    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl font-normal text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#8b0000]/20 focus:border-[#8b0000] cursor-pointer"
-  >
-    <option value="1st Semester">1st Semester</option>
-    <option value="2nd Semester">2nd Semester</option>
-    <option value="Summer Term">Summer Term</option>
-  </select>
-</div>
+              <label className="block mb-1.5">Academic Semester</label>
+              <select
+                value={semester}
+                onChange={(e) => setSemester(e.target.value)}
+                className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl font-normal text-slate-900 focus:outline-none focus:ring-2 focus:ring-[#8b0000]/20 focus:border-[#8b0000] cursor-pointer"
+              >
+                <option value="1st Semester">1st Semester</option>
+                <option value="2nd Semester">2nd Semester</option>
+                <option value="Summer Term">Summer Term</option>
+              </select>
+            </div>
 
             <form onSubmit={handleSubmit} className="space-y-4 mt-5 text-xs font-bold uppercase text-slate-700">
               <div>

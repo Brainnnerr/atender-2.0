@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { supabase, PICE_ORG_ID } from '../services/supabase';
+import { supabase } from '../services/supabase'; // Main FCO database for student profiles
+import { piceClient, PICE_ORG_ID } from '../services/piceClient'; // Secondary database for PICE tables
 
 const piceLogoUrl = '/PICE-BG.png';
 const essuLogoUrl = '/essu-logo-mini.png';
@@ -29,7 +30,8 @@ export default function ReportsTab({ currentUser }) {
   useEffect(() => {
     fetchReportData();
 
-    const channel = supabase
+    // Realtime subscription targeting secondary PICE tables
+    const channel = piceClient
       .channel('realtime_pice_reports_master_sync')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'pice_attendance' }, () => fetchReportData())
       .on('postgres_changes', { event: '*', schema: 'public', table: 'pice_fines' }, () => fetchReportData())
@@ -37,7 +39,7 @@ export default function ReportsTab({ currentUser }) {
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      piceClient.removeChannel(channel);
     };
   }, [selectedEventId, semesterFilter]);
 
@@ -45,7 +47,7 @@ export default function ReportsTab({ currentUser }) {
     try {
       setLoading(true);
 
-      let eventsQuery = supabase
+      let eventsQuery = piceClient
         .from('pice_events')
         .select('id, title, start_time, end_time, semester, fine_amount')
         .eq('organization_id', PICE_ORG_ID)
@@ -55,11 +57,12 @@ export default function ReportsTab({ currentUser }) {
         eventsQuery = eventsQuery.eq('semester', semesterFilter);
       }
 
+      // 🚀 LIGHTNING-FAST: Parallelized cross-database fetching
       const [evRes, stRes, attRes, fnRes] = await Promise.all([
         eventsQuery,
         supabase.from('profiles').select('id, full_name, student_id, course, year_level, section').or('course.ilike.%BSCE%,course.ilike.%CIVIL%').order('full_name', { ascending: true }),
-        supabase.from('pice_attendance').select('id, student_id, event_id, time_in, status, created_at'),
-        supabase.from('pice_fines').select('id, student_id, event_id, amount, status')
+        piceClient.from('pice_attendance').select('id, student_id, event_id, time_in, status, created_at'),
+        piceClient.from('pice_fines').select('id, student_id, event_id, amount, status').eq('organization_id', PICE_ORG_ID)
       ]);
 
       setEvents(evRes.data || []);
@@ -195,12 +198,12 @@ export default function ReportsTab({ currentUser }) {
 
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(8.5);
-    doc.setTextColor(30, 58, 138);
+    doc.setTextColor(15, 23, 42);
     doc.text('ESSU STUDENT CHAPTER • COLLEGE OF ENGINEERING', pageWidth / 2, 60, { align: 'center' });
 
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(11);
-    doc.setTextColor(180, 83, 9); // PICE Bronze Accent
+    doc.setTextColor(180, 83, 9);
     doc.text('OFFICIAL PICE ATTENDANCE & COMPLIANCE SUMMARY REPORT', pageWidth / 2, 80, { align: 'center' });
 
     doc.setFont('helvetica', 'normal');
@@ -382,7 +385,7 @@ export default function ReportsTab({ currentUser }) {
         </div>
         <div style={{ backgroundColor: '#ffffff', padding: '20px', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.02)' }}>
           <p style={{ fontSize: '10px', fontWeight: '800', color: '#64748b', textTransform: 'uppercase', margin: 0 }}>Total Fines Assessed</p>
-          <p style={{ fontSize: '24px', fontWeight: '900', color: '#b45309', margin: '4px 0 0 0' }}>{totalOutstanding.toFixed(2)}</p>
+          <p style={{ fontSize: '24px', fontWeight: '900', color: '#b45309', margin: '4px 0 0 0' }}>₱{totalOutstanding.toFixed(2)}</p>
         </div>
       </div>
 

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { supabase, IIEE_ORG_ID } from './services/supabase';
+import { supabase } from './services/supabase';
 
 export default function LandingPage({ onLoginSuccess }) {
   const [email, setEmail] = useState('');
@@ -14,10 +14,24 @@ export default function LandingPage({ onLoginSuccess }) {
     setLoading(true);
 
     try {
+      // 1. Dynamically locate the IIEE organization ID from the database
+      const { data: orgData, error: orgErr } = await supabase
+        .from('organizations')
+        .select('id')
+        .ilike('name', '%Electrical%')
+        .maybeSingle();
+
+      if (orgErr || !orgData) {
+        setErrorMsg('IIEE Organization profile not configured in database.');
+        setLoading(false);
+        return;
+      }
+
+      // 2. Query admin_accounts matching the organization and inputs
       const { data, error } = await supabase
         .from('admin_accounts')
         .select('*')
-        .eq('organization_id', IIEE_ORG_ID)
+        .eq('organization_id', orgData.id)
         .eq('email', email.trim())
         .eq('password', password)
         .maybeSingle();
@@ -38,7 +52,6 @@ export default function LandingPage({ onLoginSuccess }) {
   return (
     <>
       <style>{`
-        /* Reset body to ensure no default white borders/margins */
         body, html {
           margin: 0;
           padding: 0;
@@ -54,8 +67,6 @@ export default function LandingPage({ onLoginSuccess }) {
           justify-content: space-between;
           padding: 0 80px;
           box-sizing: border-box;
-          
-          /* Changed to COE-PIC.jpg. Added "fixed" so the background locks to the screen and prevents white gaps */
           background: linear-gradient(rgba(30, 20, 5, 0.7), rgba(15, 10, 2, 0.8)), url("/COE-PIC.jpg") center center / cover no-repeat fixed;
           font-family: sans-serif;
         }

@@ -1,6 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useTransition } from 'react';
 import { supabase } from '../../lib/supabaseClient';
 import { logAdminAction } from '../../lib/auditLogger';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
 
 export default function AttendanceTab({ currentUser }) {
   const [events, setEvents] = useState([]);
@@ -10,6 +12,7 @@ export default function AttendanceTab({ currentUser }) {
   const [loading, setLoading] = useState(true);
   const [deleting, setDeleting] = useState(false);
   const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
+  const [, startTransition] = useTransition();
 
   // Manual Attendance Modal States
   const [manualModalOpen, setManualModalOpen] = useState(false);
@@ -18,13 +21,30 @@ export default function AttendanceTab({ currentUser }) {
   const [manualStudentSearch, setManualStudentSearch] = useState('');
   const [manualSubmitting, setManualSubmitting] = useState(false);
 
-  // Filters
+  // PDF Preview States
+  const [previewModalOpen, setPreviewModalOpen] = useState(false);
+  const [pdfBlobUrl, setPdfBlobUrl] = useState(null);
+  const [generatingPdf, setGeneratingPdf] = useState(false);
+
+  // Filters & Pagination
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [programFilter, setProgramFilter] = useState('ALL');
   const [yearFilter, setYearFilter] = useState('ALL');
+  const [sectionFilter, setSectionFilter] = useState('ALL');
+  const [page, setPage] = useState(0);
+  const pageSize = 50;
 
   // Selected Student for Right Drawer
   const [selectedLog, setSelectedLog] = useState(null);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchQuery);
+      setPage(0);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   useEffect(() => {
     fetchEventsList();
@@ -34,25 +54,16 @@ export default function AttendanceTab({ currentUser }) {
   useEffect(() => {
     fetchAttendanceData();
 
-    // Listen to both attendance logs and student profile changes
     const channel = supabase
       .channel('realtime_admin_sync')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'attendance' },
-        () => fetchAttendanceData()
-      )
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'profiles' },
-        () => fetchAttendanceData()
-      )
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance' }, () => fetchAttendanceData())
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles' }, () => fetchAttendanceData())
       .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [selectedEventId]);
+  }, [selectedEventId, debouncedSearch, programFilter, yearFilter, sectionFilter, page]);
 
   const showToast = (message, type = 'success') => {
     setToast({ show: true, message, type });
@@ -84,7 +95,8 @@ export default function AttendanceTab({ currentUser }) {
       const { data, error } = await supabase
         .from('profiles')
         .select('id, full_name, student_id, course')
-        .order('full_name', { ascending: true });
+        .order('full_name', { ascending: true })
+        .limit(500);
 
       if (error) throw error;
       setStudents(data || []);
@@ -93,50 +105,30 @@ export default function AttendanceTab({ currentUser }) {
     }
   };
 
-  // 🚀 OPTIMIZED: Single database query joining attendance, profiles, and events
   const fetchAttendanceData = async () => {
     try {
       setLoading(true);
+      const { data, error } = await supabase.rpc('get_paginated_attendance_logs', {
+        p_event_id: selectedEventId === 'ALL' ? null : selectedEventId,
+        p_search: debouncedSearch,
+        p_program: programFilter,
+        p_year: yearFilter,
+        p_section: sectionFilter,
+        p_limit: pageSize,
+        p_offset: page * pageSize,
+      });
 
-      let query = supabase
-        .from('attendance')
-        .select(`
-          *,
-          profiles:student_id (
-            id,
-            full_name,
-            student_id,
-            course,
-            year_level,
-            section,
-            avatar_url
-          ),
-          events:event_id (
-            id,
-            title,
-            fine_amount
-          )
-        `)
-        .order('time_in', { ascending: false });
-
-      if (selectedEventId && selectedEventId !== 'ALL') {
-        query = query.eq('event_id', selectedEventId);
-      }
-
-      const { data, error } = await query;
       if (error) throw error;
 
       const logs = data || [];
-      setAttendanceLogs(logs);
-
-      if (logs.length > 0) {
-        setSelectedLog((prev) => {
-          if (!prev) return logs[0];
-          return logs.find((l) => l.id === prev.id) || logs[0];
-        });
-      } else {
-        setSelectedLog(null);
-      }
+      startTransition(() => {
+        setAttendanceLogs(logs);
+        if (logs.length > 0) {
+          setSelectedLog((prev) => (prev ? logs.find((l) => l.id === prev.id) || logs[0] : logs[0]));
+        } else {
+          setSelectedLog(null);
+        }
+      });
     } catch (err) {
       console.error('Error loading attendance logs:', err);
     } finally {
@@ -144,7 +136,119 @@ export default function AttendanceTab({ currentUser }) {
     }
   };
 
-  // Handle manual attendance submission via RPC
+  // Helper to convert image URL to base64 so jsPDF can embed it cleanly
+  const getBase64ImageFromURL = (url) => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'Anonymous';
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      img.onerror = (error) => reject(error);
+      img.src = url;
+    });
+  };
+
+  // 🚀 GENERATE PDF BLOB WITH UNIVERSITY LOGO & HEADER
+  const handleOpenPdfPreview = async () => {
+    try {
+      setGeneratingPdf(true);
+      showToast('Preparing PDF preview...');
+
+      const { data: allLogs, error } = await supabase.rpc('get_paginated_attendance_logs', {
+        p_event_id: selectedEventId === 'ALL' ? null : selectedEventId,
+        p_search: debouncedSearch,
+        p_program: programFilter,
+        p_year: yearFilter,
+        p_section: sectionFilter,
+        p_limit: 5000,
+        p_offset: 0,
+      });
+
+      if (error) throw error;
+
+      const doc = new jsPDF('p', 'mm', 'a4');
+      const activeEvent = events.find((e) => e.id === selectedEventId);
+      const eventTitle = selectedEventId === 'ALL' ? 'All Events & Assemblies' : activeEvent?.title || 'Assembly Event';
+
+      // Try adding the university logo image from your public folder or source reference
+      try {
+        // Adjust the path to where your logo is stored in your public directory (e.g., '/logo.png')
+        const logoBase64 = await getBase64ImageFromURL('src/assets/FCO-LOGOO.png');
+        doc.addImage(logoBase64, 'PNG', 14, 10, 16, 16);
+      } catch (e) {
+        console.warn('Logo image could not be loaded into PDF, skipping image placeholder:', e);
+      }
+
+      // Header Branding matching user layout specification
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(14);
+      doc.setTextColor(139, 0, 0); // #8b0000
+      doc.text('EASTERN SAMAR STATE UNIVERSITY', 34, 17);
+
+      doc.setFontSize(10);
+      doc.setTextColor(100, 100, 100);
+      doc.text('FCO-COE ATENDER ATTENDANCE REPORT', 34, 23);
+
+      // Sub-details
+      doc.setFontSize(9);
+      doc.text(`Event: ${eventTitle}`, 14, 32);
+      doc.text(`Filters: Program: ${programFilter} | Year: ${yearFilter} | Section: ${sectionFilter}`, 14, 38);
+      doc.text(`Generated On: ${new Date().toLocaleString()} | Total: ${allLogs?.length || 0}`, 14, 44);
+
+      const tableRows = (allLogs || []).map((log, index) => {
+        const student = log.profiles || {};
+        const timeLogged = new Date(log.time_in || log.time_out).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+        return [
+          index + 1,
+          student.student_id || 'N/A',
+          student.full_name || 'Unknown Student',
+          `${student.course || 'COE'} ${student.year_level || ''}${student.section || ''}`,
+          timeLogged,
+          'PRESENT',
+        ];
+      });
+
+      autoTable(doc, {
+        startY: 50,
+        head: [['No.', 'Student ID', 'Full Name', 'Program/Yr/Sec', 'Time Logged', 'Status']],
+        body: tableRows,
+        theme: 'grid',
+        headStyles: { fillColor: [139, 0, 0], textColor: [255, 255, 255], fontStyle: 'bold', fontSize: 9 },
+        bodyStyles: { fontSize: 8, textColor: [50, 50, 50] },
+        alternateRowStyles: { fillColor: [248, 250, 252] },
+      });
+
+      const pdfOutput = doc.output('bloburl');
+      setPdfBlobUrl(pdfOutput);
+      setPreviewModalOpen(true);
+    } catch (err) {
+      console.error('PDF preview generation error:', err);
+      showToast('Failed to generate PDF preview.', 'error');
+    } finally {
+      setGeneratingPdf(false);
+    }
+  };
+
+  const handleDownloadFromPreview = () => {
+    if (!pdfBlobUrl) return;
+    const activeEvent = events.find((e) => e.id === selectedEventId);
+    const link = document.createElement('a');
+    link.href = pdfBlobUrl;
+    link.download = `Atender_Attendance_Report_${selectedEventId === 'ALL' ? 'All_Events' : activeEvent?.title || 'Report'}.pdf`;
+    link.click();
+    showToast('PDF report downloaded successfully!');
+    setPreviewModalOpen(false);
+  };
+
   const handleManualAttendanceSubmit = async (e) => {
     e.preventDefault();
     if (!manualEventId || !manualStudentId) {
@@ -154,7 +258,7 @@ export default function AttendanceTab({ currentUser }) {
 
     setManualSubmitting(true);
     try {
-      const { data, error } = await supabase.rpc('admin_override_attendance_present', {
+      const { error } = await supabase.rpc('admin_override_attendance_present', {
         p_event_id: manualEventId,
         p_student_id: manualStudentId,
       });
@@ -176,7 +280,7 @@ export default function AttendanceTab({ currentUser }) {
         },
       });
 
-      showToast('Student successfully marked present and any fines waived!');
+      showToast('Student successfully marked present and fines waived!');
       setManualModalOpen(false);
       setManualStudentId('');
       setManualStudentSearch('');
@@ -188,7 +292,6 @@ export default function AttendanceTab({ currentUser }) {
     }
   };
 
-  // Invalidate Attendance, assess fine, and record audit log
   const handleDeleteAttendance = async (log) => {
     const studentName = log.profiles?.full_name || 'this student';
     const eventTitle = log.events?.title || 'the event';
@@ -235,21 +338,6 @@ export default function AttendanceTab({ currentUser }) {
     }
   };
 
-  const filteredLogs = attendanceLogs.filter((log) => {
-    const prof = log.profiles || {};
-    const name = (prof.full_name || '').toLowerCase();
-    const sId = (prof.student_id || '').toLowerCase();
-    const course = prof.course || '';
-    const year = prof.year_level?.toString() || '';
-
-    const matchesSearch =
-      name.includes(searchQuery.toLowerCase()) || sId.includes(searchQuery.toLowerCase());
-    const matchesProgram = programFilter === 'ALL' || course === programFilter;
-    const matchesYear = yearFilter === 'ALL' || year === yearFilter;
-
-    return matchesSearch && matchesProgram && matchesYear;
-  });
-
   const filteredModalStudents = students.filter((stu) => {
     const name = (stu.full_name || '').toLowerCase();
     const sId = (stu.student_id || '').toLowerCase();
@@ -259,7 +347,7 @@ export default function AttendanceTab({ currentUser }) {
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto relative">
-      {/* Toast Notification Banner */}
+      {/* Toast Notification */}
       {toast.show && (
         <div className="fixed top-6 right-6 z-[100] animate-bounce">
           <div
@@ -269,18 +357,26 @@ export default function AttendanceTab({ currentUser }) {
                 : 'bg-emerald-50 text-emerald-800 border-emerald-200'
             }`}
           >
-            <span>{toast.type === 'error' ? '⚠️' : '✓'}</span>
+            {toast.type === 'error' ? (
+              <svg className="w-4 h-4 text-red-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+            ) : (
+              <svg className="w-4 h-4 text-emerald-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+            )}
             <span>{toast.message}</span>
           </div>
         </div>
       )}
 
-      {/* 1. TOP BAR WITH MANUAL ATTENDANCE BUTTON */}
+      {/* 1. TOP BAR WITH PDF PREVIEW BUTTON */}
       <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div>
           <h2 className="text-xl font-black text-slate-800 tracking-tight">Attendance Audit & Verification</h2>
           <p className="text-xs text-slate-500 font-medium mt-0.5">
-            Inspect real-time student check-ins, verify selfie photo proofs, or manually assign attendance for past events.
+            Inspect real-time student check-ins, verify selfie photo proofs, or preview and export official PDF reports.
           </p>
         </div>
 
@@ -302,15 +398,30 @@ export default function AttendanceTab({ currentUser }) {
           </div>
 
           <button
+            onClick={handleOpenPdfPreview}
+            disabled={generatingPdf}
+            className="px-4 py-2.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-bold text-xs uppercase tracking-wider rounded-xl transition shadow-md flex items-center gap-2 cursor-pointer whitespace-nowrap"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+            </svg>
+            <span>{generatingPdf ? 'Generating...' : 'Preview PDF Report'}</span>
+          </button>
+
+          <button
             onClick={() => setManualModalOpen(true)}
             className="px-4 py-2.5 bg-[#8b0000] hover:bg-[#700000] text-white font-bold text-xs uppercase tracking-wider rounded-xl transition shadow-md shadow-[#8b0000]/20 flex items-center gap-2 cursor-pointer whitespace-nowrap"
           >
-            <span>+ Manual Attendance</span>
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+            <span>Manual Attendance</span>
           </button>
         </div>
       </div>
 
-      {/* 2. FILTER & SEARCH BAR */}
+      {/* 2. FILTER & SEARCH BAR WITH SECTION DROPDOWN */}
       <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm flex flex-col lg:flex-row gap-4 items-center justify-between">
         <div className="w-full lg:w-80 relative">
           <input
@@ -356,6 +467,19 @@ export default function AttendanceTab({ currentUser }) {
             <option value="3">3rd Year</option>
             <option value="4">4th Year</option>
           </select>
+
+          {/* Section Dropdown */}
+          <select
+            value={sectionFilter}
+            onChange={(e) => setSectionFilter(e.target.value)}
+            className="px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#8b0000]/20 cursor-pointer"
+          >
+            <option value="ALL">All Sections</option>
+            <option value="A">Section A</option>
+            <option value="B">Section B</option>
+            <option value="C">Section C</option>
+            <option value="D">Section D</option>
+          </select>
         </div>
       </div>
 
@@ -365,22 +489,38 @@ export default function AttendanceTab({ currentUser }) {
         <div className="lg:col-span-7 bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden">
           <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
             <span className="text-xs font-black text-slate-800 uppercase tracking-wider">
-              Logged Students ({filteredLogs.length})
+              Loaded Logs ({attendanceLogs.length})
             </span>
-            <span className="text-[11px] font-bold text-slate-400">Click a record to inspect proof</span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page === 0}
+                className="px-2.5 py-1 bg-white border border-slate-200 rounded-lg text-xs font-bold disabled:opacity-40 cursor-pointer"
+              >
+                Prev
+              </button>
+              <span className="text-xs font-bold text-slate-600">Page {page + 1}</span>
+              <button
+                onClick={() => setPage((p) => p + 1)}
+                disabled={attendanceLogs.length < pageSize}
+                className="px-2.5 py-1 bg-white border border-slate-200 rounded-lg text-xs font-bold disabled:opacity-40 cursor-pointer"
+              >
+                Next
+              </button>
+            </div>
           </div>
 
           {loading ? (
             <div className="p-12 text-center text-xs font-bold text-slate-400 uppercase tracking-wider">
               Loading attendance logs...
             </div>
-          ) : filteredLogs.length === 0 ? (
+          ) : attendanceLogs.length === 0 ? (
             <div className="p-12 text-center text-xs font-bold text-slate-400 uppercase tracking-wider">
-              No attendance records logged for this filter.
+              No attendance records found.
             </div>
           ) : (
             <div className="divide-y divide-slate-100 max-h-[620px] overflow-y-auto">
-              {filteredLogs.map((log) => {
+              {attendanceLogs.map((log) => {
                 const isSelected = selectedLog?.id === log.id;
                 const student = log.profiles || {};
                 const logTime = log.time_in || log.time_out || log.created_at;
@@ -408,7 +548,7 @@ export default function AttendanceTab({ currentUser }) {
                         <p className="text-xs font-bold text-slate-900 truncate">{student.full_name || 'Registered Student'}</p>
                         <p className="text-[11px] font-mono text-slate-400">{student.student_id || 'ID Pending'}</p>
                         <p className="text-[10px] font-bold text-slate-500 uppercase mt-0.5">
-                          {student.course || 'COE'} • {student.year_level || ''}{student.section || ''}
+                          {student.course || 'COE'} • {student.year_level || ''} - Sec {student.section || 'N/A'}
                         </p>
                       </div>
                     </div>
@@ -466,8 +606,12 @@ export default function AttendanceTab({ currentUser }) {
               </div>
 
               <div>
-                <label className="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">
-                  📷 Selfie Attendance Proof
+                <label className="block text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                  <svg className="w-3.5 h-3.5 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                  </svg>
+                  <span>Selfie Attendance Proof</span>
                 </label>
                 <div className="w-full h-64 rounded-2xl bg-slate-900 overflow-hidden border border-slate-200 flex items-center justify-center relative shadow-inner">
                   {selectedLog.proof_photo_url ? (
@@ -478,7 +622,9 @@ export default function AttendanceTab({ currentUser }) {
                     />
                   ) : (
                     <div className="text-center p-4">
-                      <span className="text-2xl">📸</span>
+                      <svg className="w-8 h-8 text-slate-500 mx-auto mb-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5.121 17.804A13.937 13.937 0 0112 16c2.5 0 4.847.655 6.879 1.804M15 10a3 3 0 11-6 0 3 3 0 016 0zm6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
                       <p className="text-slate-400 text-xs font-semibold mt-1">
                         No selfie photo proof recorded (Manually assigned).
                       </p>
@@ -489,13 +635,14 @@ export default function AttendanceTab({ currentUser }) {
 
               <div className="grid grid-cols-2 gap-3 text-xs">
                 <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
-                   <p className="font-black text-slate-800 mt-0.5">{selectedLog.profiles?.course || 'COE'}</p>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase">Program</p>
+                  <p className="font-black text-slate-800 mt-0.5">{selectedLog.profiles?.course || 'COE'}</p>
                 </div>
 
                 <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
                   <p className="text-[10px] font-bold text-slate-400 uppercase">Year & Section</p>
                   <p className="font-black text-slate-800 mt-0.5">
-                    {selectedLog.profiles?.year_level ? `${selectedLog.profiles.year_level}th` : ''} - Sec {selectedLog.profiles?.section || ''}
+                    {selectedLog.profiles?.year_level ? `${selectedLog.profiles.year_level}th` : ''} - Sec {selectedLog.profiles?.section || 'N/A'}
                   </p>
                 </div>
 
@@ -522,16 +669,60 @@ export default function AttendanceTab({ currentUser }) {
                   </svg>
                   <span>{deleting ? 'Processing...' : 'Reject Proof & Issue Fine'}</span>
                 </button>
-                <p className="text-[10px] text-slate-400 text-center font-medium mt-1.5">
-                  Deletes check-in and immediately issues a ₱{parseFloat(selectedLog.events?.fine_amount || 0).toFixed(2)} fine.
-                </p>
               </div>
             </div>
           )}
         </div>
       </div>
 
-      {/* MANUAL ATTENDANCE ASSIGNMENT MODAL */}
+      {/* PDF PREVIEW MODAL */}
+      {previewModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-4xl w-full h-[90vh] flex flex-col shadow-2xl border border-slate-100 overflow-hidden">
+            <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+              <h3 className="font-black text-slate-800 uppercase tracking-wide text-xs">
+                Attendance Report PDF Preview
+              </h3>
+              <button
+                onClick={() => setPreviewModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 font-bold text-xl leading-none cursor-pointer"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="flex-1 bg-slate-100 p-4">
+              {pdfBlobUrl ? (
+                <iframe src={pdfBlobUrl} className="w-full h-full rounded-xl border border-slate-200" title="PDF Preview" />
+              ) : (
+                <div className="flex items-center justify-center h-full text-xs font-bold text-slate-400">
+                  Loading preview...
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 border-t border-slate-100 flex justify-end gap-3 bg-white">
+              <button
+                onClick={() => setPreviewModalOpen(false)}
+                className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs uppercase tracking-wider rounded-xl transition cursor-pointer"
+              >
+                Close
+              </button>
+              <button
+                onClick={handleDownloadFromPreview}
+                className="px-5 py-2.5 bg-[#8b0000] hover:bg-[#700000] text-white font-bold text-xs uppercase tracking-wider rounded-xl transition shadow-md cursor-pointer flex items-center gap-2"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                <span>Confirm & Download PDF</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MANUAL ATTENDANCE MODAL */}
       {manualModalOpen && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100">
@@ -549,7 +740,7 @@ export default function AttendanceTab({ currentUser }) {
 
             <form onSubmit={handleManualAttendanceSubmit} className="space-y-4 mt-4 text-xs font-bold uppercase text-slate-700">
               <div>
-                <label className="block mb-1.5">Select Event (Past or Present)</label>
+                <label className="block mb-1.5">Select Event</label>
                 <select
                   required
                   value={manualEventId}
@@ -574,7 +765,6 @@ export default function AttendanceTab({ currentUser }) {
                   onChange={(e) => setManualStudentSearch(e.target.value)}
                   className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl font-normal text-slate-900 placeholder-slate-400 mb-2 focus:outline-none focus:ring-2 focus:ring-[#8b0000]/20 focus:border-[#8b0000]"
                 />
-                
                 <select
                   required
                   size={4}
@@ -589,10 +779,6 @@ export default function AttendanceTab({ currentUser }) {
                     </option>
                   ))}
                 </select>
-              </div>
-
-              <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-amber-800 font-normal text-[11px] leading-relaxed">
-                ℹ️ Recording attendance here will mark the student as **Present** for the chosen event and automatically waive any associated fines.
               </div>
 
               <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
@@ -617,4 +803,4 @@ export default function AttendanceTab({ currentUser }) {
       )}
     </div>
   );
-}  
+}

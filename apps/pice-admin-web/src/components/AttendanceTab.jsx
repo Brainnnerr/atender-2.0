@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { supabase, PICE_ORG_ID } from '../services/supabase';
-import { CheckCircle2, AlertTriangle, Camera, Search, X, ShieldAlert, Clock, UserCheck } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { piceClient, PICE_ORG_ID } from '../services/piceClient';
+import { supabase } from '../services/supabase';
+import { CheckCircle2, AlertTriangle, Camera, Search, X, ShieldAlert, Clock, UserCheck, ChevronLeft, ChevronRight, Download } from 'lucide-react';
 
 export default function AttendanceTab({ currentUser }) {
   const [events, setEvents] = useState([]);
@@ -11,20 +12,20 @@ export default function AttendanceTab({ currentUser }) {
   const [deleting, setDeleting] = useState(false);
   const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
 
-  // Manual Attendance Modal States
+  const [currentPage, setCurrentPage] = useState(1);
+  const pageSize = 10;
+
   const [manualModalOpen, setManualModalOpen] = useState(false);
   const [manualEventId, setManualEventId] = useState('');
   const [manualStudentId, setManualStudentId] = useState('');
   const [manualStudentSearch, setManualStudentSearch] = useState('');
   const [manualSubmitting, setManualSubmitting] = useState(false);
 
-  // Filters (Dropdowns for Program, Year, Section)
   const [searchQuery, setSearchQuery] = useState('');
   const [programFilter, setProgramFilter] = useState('ALL');
   const [yearFilter, setYearFilter] = useState('ALL');
   const [sectionFilter, setSectionFilter] = useState('ALL');
 
-  // Selected Student for Right Drawer
   const [selectedLog, setSelectedLog] = useState(null);
 
   useEffect(() => {
@@ -33,24 +34,20 @@ export default function AttendanceTab({ currentUser }) {
   }, []);
 
   useEffect(() => {
+    setCurrentPage(1);
     fetchAttendanceData();
 
-    const channel = supabase
+    const channel = piceClient
       .channel('realtime_pice_admin_sync')
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'pice_attendance' },
         () => fetchAttendanceData()
       )
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'profiles' },
-        () => fetchAttendanceData()
-      )
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      piceClient.removeChannel(channel);
     };
   }, [selectedEventId]);
 
@@ -63,7 +60,7 @@ export default function AttendanceTab({ currentUser }) {
 
   const fetchEventsList = async () => {
     try {
-      const { data, error } = await supabase
+      const { data, error } = await piceClient
         .from('pice_events')
         .select('id, title, start_time, end_time, fine_amount')
         .eq('organization_id', PICE_ORG_ID)
@@ -99,7 +96,7 @@ export default function AttendanceTab({ currentUser }) {
     try {
       setLoading(true);
 
-      let attQuery = supabase
+      let attQuery = piceClient
         .from('pice_attendance')
         .select('*')
         .order('time_in', { ascending: false });
@@ -118,6 +115,7 @@ export default function AttendanceTab({ currentUser }) {
       }
 
       const studentIds = [...new Set(rawAttendance.map((a) => a.student_id).filter(Boolean))];
+      
       const { data: profilesData, error: profError } = await supabase
         .from('profiles')
         .select('*')
@@ -126,7 +124,8 @@ export default function AttendanceTab({ currentUser }) {
       if (profError) throw profError;
 
       const eventIds = [...new Set(rawAttendance.map((a) => a.event_id).filter(Boolean))];
-      const { data: eventsData, error: evError } = await supabase
+      
+      const { data: eventsData, error: evError } = await piceClient
         .from('pice_events')
         .select('*')
         .in('id', eventIds);
@@ -179,7 +178,7 @@ export default function AttendanceTab({ currentUser }) {
 
     setManualSubmitting(true);
     try {
-      const { error } = await supabase.rpc('admin_override_pice_attendance_present', {
+      const { error } = await piceClient.rpc('admin_override_pice_attendance_present', {
         p_event_id: manualEventId,
         p_student_id: manualStudentId,
       });
@@ -214,7 +213,7 @@ export default function AttendanceTab({ currentUser }) {
 
     try {
       setDeleting(true);
-      const { data: res, error } = await supabase.rpc('admin_invalidate_pice_attendance', {
+      const { data: res, error } = await piceClient.rpc('admin_invalidate_pice_attendance', {
         p_attendance_id: log.id,
       });
 
@@ -247,6 +246,10 @@ export default function AttendanceTab({ currentUser }) {
     return matchesSearch && matchesProgram && matchesYear && matchesSection;
   });
 
+  const totalPages = Math.ceil(filteredLogs.length / pageSize) || 1;
+  const startIndex = (currentPage - 1) * pageSize;
+  const paginatedLogs = filteredLogs.slice(startIndex, startIndex + pageSize);
+
   const filteredModalStudents = students.filter((stu) => {
     const name = (stu.full_name || '').toLowerCase();
     const sId = (stu.student_id || '').toLowerCase();
@@ -254,9 +257,101 @@ export default function AttendanceTab({ currentUser }) {
     return name.includes(query) || sId.includes(query);
   });
 
+  const handleDownloadPDF = () => {
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+      alert('Please allow popups for this website to generate the PDF preview.');
+      return;
+    }
+
+    const currentEventObj = events.find((e) => e.id === selectedEventId);
+    const eventTitleDisplay = selectedEventId === 'ALL' ? 'All PICE Assemblies' : (currentEventObj?.title || 'Selected PICE Event');
+    const filterDesc = `Event: ${eventTitleDisplay} | Program: ${programFilter} | Year: ${yearFilter} | Section: ${sectionFilter}`;
+
+    const rowsHtml = filteredLogs.map((log, idx) => {
+      const studentName = log.profiles?.full_name || 'N/A';
+      const studentIdNum = log.profiles?.student_id || 'N/A';
+      const studentCourse = log.profiles?.course || 'BSCE';
+      const studentYearSec = `${log.profiles?.year_level || ''}${log.profiles?.section || ''}`;
+      const timeFormatted = new Date(log.time_in || log.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+      return `
+        <tr>
+          <td>${idx + 1}</td>
+          <td><strong>${studentName}</strong></td>
+          <td><code>${studentIdNum}</code></td>
+          <td>${studentCourse} - ${studentYearSec}</td>
+          <td>${timeFormatted}</td>
+          <td><span style="color: #059669; font-weight: bold;">PRESENT</span></td>
+        </tr>
+      `;
+    }).join('');
+
+    const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>PICE Official Attendance Roster</title>
+          <style>
+            @page { size: A4 portrait; margin: 15mm; }
+            body { font-family: sans-serif; padding: 0; margin: 0; color: #0f172a; background: #ffffff; }
+            .header { display: flex; align-items: center; gap: 16px; border-bottom: 3px solid #b45309; padding-bottom: 14px; margin-bottom: 16px; }
+            .logo { width: 56px; height: 56px; border-radius: 50%; object-fit: cover; border: 2px solid #b45309; }
+            .title-block h1 { font-size: 18px; font-weight: 900; margin: 0; text-transform: uppercase; color: #b45309; }
+            .title-block p { font-size: 11px; color: #64748b; margin: 3px 0 0 0; }
+            .meta { font-size: 11px; color: #475569; margin-bottom: 16px; font-weight: 700; display: flex; justify-content: space-between; background: #f8fafc; padding: 8px 12px; border-radius: 6px; border: 1px solid #e2e8f0; }
+            table { width: 100%; border-collapse: collapse; font-size: 11px; text-align: left; }
+            th { background-color: #f8fafc; color: #475569; border-bottom: 2px solid #cbd5e1; padding: 8px 10px; text-transform: uppercase; font-size: 10px; }
+            td { border-bottom: 1px solid #e2e8f0; padding: 8px 10px; color: #1e293b; }
+            tr:nth-child(even) { background-color: #fcfcfc; }
+            .footer { margin-top: 24px; text-align: right; font-size: 10px; color: #94a3b8; }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <img src="/PICE-LOGO.jpg" alt="PICE Logo" class="logo" onerror="this.style.display='none'" />
+            <div class="title-block">
+              <h1>PICE - ESSU Attendance Audit Report</h1>
+              <p>Official Verified Check-Ins & Telemetry Logs</p>
+            </div>
+          </div>
+          <div class="meta">
+            <span><strong>Filters:</strong> ${filterDesc}</span>
+            <span><strong>Total Logged:</strong> ${filteredLogs.length}</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 40px;">No.</th>
+                <th>Student Full Name</th>
+                <th>Student Number</th>
+                <th>Program / Year & Sec</th>
+                <th>Time Logged In</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rowsHtml}
+            </tbody>
+          </table>
+          <div class="footer">
+            Atender Multi-Departmental System &bull; Generated on: ${new Date().toLocaleDateString()}
+          </div>
+          <script>
+            window.onload = function() {
+              window.print();
+            };
+          </script>
+        </body>
+      </html>
+    `;
+
+    printWindow.document.write(htmlContent);
+    printWindow.document.close();
+  };
+
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', fontFamily: 'sans-serif' }}>
-      {/* Toast Notification */}
       {toast.show && (
         <div style={{ position: 'fixed', top: '24px', right: '24px', zIndex: 9999 }}>
           <div style={{
@@ -279,7 +374,6 @@ export default function AttendanceTab({ currentUser }) {
         </div>
       )}
 
-      {/* 1. ACTION BAR */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#ffffff', padding: '24px', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.02)', marginBottom: '24px', flexWrap: 'wrap', gap: '16px' }}>
         <div>
           <h2 style={{ fontSize: '16px', fontWeight: '700', textTransform: 'uppercase', color: '#0f172a', margin: 0, letterSpacing: '0.5px' }}>PICE Attendance Audit & Verification</h2>
@@ -287,16 +381,26 @@ export default function AttendanceTab({ currentUser }) {
             Inspect real-time BSCE student check-ins, verify selfie photo proofs, or manually assign PICE attendance.
           </p>
         </div>
-        <button
-          onClick={() => setManualModalOpen(true)}
-          style={{ backgroundColor: '#4a0404', color: '#ffffff', padding: '10px 18px', borderRadius: '10px', fontWeight: '600', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.5px', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', boxShadow: '0 2px 4px rgba(74, 4, 4, 0.15)' }}
-        >
-          <UserCheck size={15} />
-          <span>Manual Attendance</span>
-        </button>
+        
+        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+          <button
+            onClick={handleDownloadPDF}
+            style={{ backgroundColor: '#b45309', color: '#ffffff', padding: '10px 16px', borderRadius: '10px', fontWeight: '700', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.5px', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', boxShadow: '0 2px 4px rgba(180, 83, 9, 0.2)' }}
+          >
+            <Download size={15} />
+            <span>Download PDF Roster</span>
+          </button>
+
+          <button
+            onClick={() => setManualModalOpen(true)}
+            style={{ backgroundColor: '#4a0404', color: '#ffffff', padding: '10px 18px', borderRadius: '10px', fontWeight: '600', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.5px', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', boxShadow: '0 2px 4px rgba(74, 4, 4, 0.15)' }}
+          >
+            <UserCheck size={15} />
+            <span>Manual Attendance</span>
+          </button>
+        </div>
       </div>
 
-      {/* 2. FILTER AND SEARCH BAR (Dropdowns for Program, Year, Section) */}
       <div style={{ backgroundColor: '#ffffff', padding: '16px 20px', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.02)', display: 'flex', gap: '14px', alignItems: 'center', justifyContent: 'space-between', marginBottom: '24px', flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: '220px' }}>
           <span style={{ fontSize: '11px', fontWeight: '700', color: '#64748b', textTransform: 'uppercase' }}>Event:</span>
@@ -307,9 +411,7 @@ export default function AttendanceTab({ currentUser }) {
           >
             <option value="ALL">All PICE Assemblies</option>
             {events.map((evt) => (
-              <option key={evt.id} value={evt.id}>
-                {evt.title}
-              </option>
+              <option key={evt.id} value={evt.id}>{evt.title}</option>
             ))}
           </select>
         </div>
@@ -319,17 +421,16 @@ export default function AttendanceTab({ currentUser }) {
             type="text"
             placeholder="Search BSCE student name or ID..."
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => { setSearchQuery(e.target.value); setCurrentPage(1); }}
             style={{ width: '100%', padding: '9px 12px 9px 36px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', boxSizing: 'border-box', outline: 'none', fontWeight: '400' }}
           />
           <Search size={15} color="#94a3b8" style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)' }} />
         </div>
 
-        {/* Dropdowns for Program, Year, Section */}
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
           <select
             value={programFilter}
-            onChange={(e) => setProgramFilter(e.target.value)}
+            onChange={(e) => { setProgramFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Program: All</option>
@@ -339,7 +440,7 @@ export default function AttendanceTab({ currentUser }) {
 
           <select
             value={yearFilter}
-            onChange={(e) => setYearFilter(e.target.value)}
+            onChange={(e) => { setYearFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Year: All</option>
@@ -351,7 +452,7 @@ export default function AttendanceTab({ currentUser }) {
 
           <select
             value={sectionFilter}
-            onChange={(e) => setSectionFilter(e.target.value)}
+            onChange={(e) => { setSectionFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Section: All</option>
@@ -362,74 +463,93 @@ export default function AttendanceTab({ currentUser }) {
         </div>
       </div>
 
-      {/* 3. TWO-PANE LAYOUT */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '20px', alignItems: 'start' }}>
-        {/* LEFT PANE: ATTENDANCE RECORDS LIST */}
         <div style={{ backgroundColor: '#ffffff', borderRadius: '16px', border: '1px solid #e2e8f0', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.02)' }}>
           <div style={{ padding: '14px 16px', borderBottom: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f8fafc' }}>
             <span style={{ fontSize: '11px', fontWeight: '700', color: '#0f172a', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
               Logged BSCE Students ({filteredLogs.length})
             </span>
-            <span style={{ fontSize: '10px', fontWeight: '600', color: '#64748b' }}>Click record to inspect</span>
+            <span style={{ fontSize: '10px', fontWeight: '600', color: '#64748b' }}>Page {currentPage} of {totalPages}</span>
           </div>
 
           {loading ? (
             <div style={{ padding: '48px', textAlign: 'center', fontSize: '11px', fontWeight: '600', color: '#94a3b8', textTransform: 'uppercase' }}>
               Loading PICE attendance logs...
             </div>
-          ) : filteredLogs.length === 0 ? (
+          ) : paginatedLogs.length === 0 ? (
             <div style={{ padding: '48px', textAlign: 'center', fontSize: '11px', fontWeight: '600', color: '#94a3b8', textTransform: 'uppercase' }}>
               No PICE attendance records found.
             </div>
           ) : (
-            <div style={{ maxHeight: '580px', overflowY: 'auto' }}>
-              {filteredLogs.map((log) => {
-                const isSelected = selectedLog?.id === log.id;
-                const student = log.profiles || {};
-                const logTime = log.time_in || log.time_out || log.created_at;
+            <div>
+              <div style={{ minHeight: '420px' }}>
+                {paginatedLogs.map((log) => {
+                  const isSelected = selectedLog?.id === log.id;
+                  const student = log.profiles || {};
+                  const logTime = log.time_in || log.time_out || log.created_at;
 
-                return (
-                  <div
-                    key={log.id}
-                    onClick={() => setSelectedLog(log)}
-                    style={{
-                      padding: '12px 16px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      borderBottom: '1px solid #f1f5f9',
-                      backgroundColor: isSelected ? '#fef2f2' : '#ffffff',
-                      borderLeft: isSelected ? '4px solid #4a0404' : '4px solid transparent',
-                      cursor: 'pointer',
-                      transition: 'background 0.15s'
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: 1, minWidth: 0 }}>
-                      <div style={{ width: '38px', height: '38px', borderRadius: '50%', backgroundColor: '#e2e8f0', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, fontWeight: '700', fontSize: '12px', color: '#475569' }}>
-                        {student.avatar_url ? (
-                          <img src={student.avatar_url} alt="Profile" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                        ) : (
-                          student.full_name?.charAt(0) || 'S'
-                        )}
+                  return (
+                    <div
+                      key={log.id}
+                      onClick={() => setSelectedLog(log)}
+                      style={{
+                        padding: '12px 16px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        borderBottom: '1px solid #f1f5f9',
+                        backgroundColor: isSelected ? '#fef2f2' : '#ffffff',
+                        borderLeft: isSelected ? '4px solid #4a0404' : '4px solid transparent',
+                        cursor: 'pointer',
+                        transition: 'background 0.15s'
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: 1, minWidth: 0 }}>
+                        <div style={{ width: '38px', height: '38px', borderRadius: '50%', backgroundColor: '#e2e8f0', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, fontWeight: '700', fontSize: '12px', color: '#475569' }}>
+                          {student.avatar_url ? (
+                            <img src={student.avatar_url} alt="Profile" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                          ) : (
+                            student.full_name?.charAt(0) || 'S'
+                          )}
+                        </div>
+                        <div style={{ minWidth: 0 }}>
+                          <p style={{ fontWeight: '600', color: '#0f172a', margin: '0 0 2px 0', fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{student.full_name || 'Registered Student'}</p>
+                          <p style={{ fontSize: '11px', color: '#64748b', margin: 0, fontWeight: '400', fontFamily: 'monospace' }}>{student.student_id || 'ID Pending'}</p>
+                        </div>
                       </div>
-                      <div style={{ minWidth: 0 }}>
-                        <p style={{ fontWeight: '600', color: '#0f172a', margin: '0 0 2px 0', fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{student.full_name || 'Registered Student'}</p>
-                        <p style={{ fontSize: '11px', color: '#64748b', margin: 0, fontWeight: '400', fontFamily: 'monospace' }}>{student.student_id || 'ID Pending'}</p>
+                      <div style={{ textAlign: 'right', flexShrink: 0, marginLeft: '8px' }}>
+                        <span style={{ fontSize: '10px', fontWeight: '600', backgroundColor: '#ecfdf5', color: '#065f46', padding: '3px 8px', borderRadius: '6px', border: '1px solid #a7f3d0' }}>
+                          {new Date(logTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
                       </div>
                     </div>
-                    <div style={{ textAlign: 'right', flexShrink: 0, marginLeft: '8px' }}>
-                      <span style={{ fontSize: '10px', fontWeight: '600', backgroundColor: '#ecfdf5', color: '#065f46', padding: '3px 8px', borderRadius: '6px', border: '1px solid #a7f3d0' }}>
-                        {new Date(logTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
+                  );
+                })}
+              </div>
+
+              <div style={{ padding: '12px 16px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f8fafc' }}>
+                <button
+                  onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+                  disabled={currentPage === 1}
+                  style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: '#ffffff', fontSize: '11px', fontWeight: '700', cursor: currentPage === 1 ? 'not-allowed' : 'pointer', opacity: currentPage === 1 ? 0.4 : 1, display: 'flex', alignItems: 'center', gap: '4px', color: '#334155' }}
+                >
+                  <ChevronLeft size={14} /> Prev
+                </button>
+                <span style={{ fontSize: '11px', fontWeight: '700', color: '#475569' }}>
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
+                  disabled={currentPage === totalPages}
+                  style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: '#ffffff', fontSize: '11px', fontWeight: '700', cursor: currentPage === totalPages ? 'not-allowed' : 'pointer', opacity: currentPage === totalPages ? 0.4 : 1, display: 'flex', alignItems: 'center', gap: '4px', color: '#334155' }}
+                >
+                  Next <ChevronRight size={14} />
+                </button>
+              </div>
             </div>
           )}
         </div>
 
-        {/* RIGHT PANE: DETAIL & PHOTO PROOF DRAWER */}
         <div style={{ backgroundColor: '#ffffff', borderRadius: '16px', border: '1px solid #e2e8f0', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.02)', padding: '20px' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingBottom: '12px', borderBottom: '1px solid #e2e8f0', marginBottom: '16px' }}>
             <h3 style={{ fontSize: '12px', fontWeight: '700', textTransform: 'uppercase', color: '#0f172a', margin: 0, letterSpacing: '0.5px' }}>PICE Verification & Photo Proof</h3>
@@ -474,7 +594,6 @@ export default function AttendanceTab({ currentUser }) {
                 </div>
               </div>
 
-              {/* Program, Year & Sec */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', fontSize: '12px' }}>
                 <div style={{ padding: '10px', backgroundColor: '#f8fafc', borderRadius: '10px', border: '1px solid #e2e8f0' }}>
                   <p style={{ fontSize: '10px', fontWeight: '700', color: '#64748b', textTransform: 'uppercase', margin: '0 0 2px 0' }}>Program</p>
@@ -488,7 +607,6 @@ export default function AttendanceTab({ currentUser }) {
                 </div>
               </div>
 
-              {/* Time Logged In Badge placed right below Program / Year & Sec */}
               <div style={{ padding: '10px 12px', backgroundColor: '#ecfdf5', borderRadius: '10px', border: '1px solid #a7f3d0', display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <Clock size={15} color="#059669" />
                 <div>
@@ -520,7 +638,6 @@ export default function AttendanceTab({ currentUser }) {
         </div>
       </div>
 
-      {/* MANUAL ATTENDANCE MODAL */}
       {manualModalOpen && (
         <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, padding: '20px' }}>
           <div style={{ backgroundColor: '#ffffff', borderRadius: '20px', maxWidth: '440px', width: '100%', padding: '28px', boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)' }}>

@@ -1,17 +1,33 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useTransition } from 'react';
 import { supabase } from '../../lib/supabaseClient';
 
 export default function StudentSummaryTab() {
   const [students, setStudents] = useState([]);
   const [selectedStudent, setSelectedStudent] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [semesterFilter, setSemesterFilter] = useState('1st Semester'); // Default semester filter
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [semesterFilter, setSemesterFilter] = useState('1st Semester');
   const [summaryData, setSummaryData] = useState({ events: [], attendanceMap: {}, fines: [] });
   const [loading, setLoading] = useState(false);
+  const [listLoading, setListLoading] = useState(false);
+  
+  // Pagination states
+  const [page, setPage] = useState(0);
+  const pageSize = 20;
+  const [, startTransition] = useTransition();
+
+  // Debounce search input
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchQuery);
+      setPage(0);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   useEffect(() => {
-    fetchStudentsList();
-  }, []);
+    fetchPaginatedStudents();
+  }, [debouncedSearch, semesterFilter, page]);
 
   useEffect(() => {
     if (selectedStudent) {
@@ -19,21 +35,31 @@ export default function StudentSummaryTab() {
     }
   }, [selectedStudent, semesterFilter]);
 
-  const fetchStudentsList = async () => {
+  const fetchPaginatedStudents = async () => {
     try {
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('id, full_name, student_id, course, year_level, section, avatar_url, email')
-        .eq('role', 'student')
-        .order('full_name', { ascending: true });
+      setListLoading(true);
+      const { data, error } = await supabase.rpc('get_paginated_student_summaries', {
+        p_search: debouncedSearch,
+        p_semester: semesterFilter,
+        p_limit: pageSize,
+        p_offset: page * pageSize,
+      });
 
       if (error) throw error;
-      setStudents(data || []);
-      if (data && data.length > 0) {
-        setSelectedStudent(data[0]);
-      }
+      const list = data || [];
+      
+      startTransition(() => {
+        setStudents(list);
+        if (list.length > 0) {
+          setSelectedStudent((prev) => (prev ? list.find((s) => s.id === prev.id) || list[0] : list[0]));
+        } else {
+          setSelectedStudent(null);
+        }
+      });
     } catch (err) {
-      console.error('Error fetching students:', err);
+      console.error('Error fetching paginated students:', err);
+    } finally {
+      setListLoading(false);
     }
   };
 
@@ -41,28 +67,27 @@ export default function StudentSummaryTab() {
     try {
       setLoading(true);
 
-      // 1. Fetch Main FCO Events
+      // 1. Fetch Events filtered by semester
       const { data: eventsData, error: evErr } = await supabase
         .from('events')
         .select('*')
         .order('start_time', { ascending: false });
       if (evErr) throw evErr;
 
-      // Filter events locally by semester if selected
-      const filteredEvents = (eventsData || []).filter(evt => {
+      const filteredEvents = (eventsData || []).filter((evt) => {
         if (semesterFilter === 'ALL') return true;
         const sem = evt.semester || '1st Semester';
         return sem.toLowerCase() === semesterFilter.toLowerCase();
       });
 
-      // 2. Fetch Main FCO Attendance
+      // 2. Fetch Attendance for student
       const { data: attData, error: attErr } = await supabase
         .from('attendance')
         .select('*')
         .eq('student_id', studentId);
       if (attErr) throw attErr;
 
-      // 3. Fetch Main FCO Fines
+      // 3. Fetch Fines for student
       const { data: finesData, error: fineErr } = await supabase
         .from('fines')
         .select('*')
@@ -86,20 +111,13 @@ export default function StudentSummaryTab() {
     }
   };
 
-  const filteredStudents = students.filter((s) => {
-    const name = (s.full_name || '').toLowerCase();
-    const sId = (s.student_id || '').toLowerCase();
-    const q = searchQuery.toLowerCase();
-    return name.includes(q) || sId.includes(q);
-  });
-
   const totalEvents = summaryData.events.length;
   const attendedCount = summaryData.events.filter((evt) => {
     const att = summaryData.attendanceMap[evt.id];
     return !!(att?.time_in || att?.time_out);
   }).length;
   const absentCount = Math.max(0, totalEvents - attendedCount);
-  
+
   const totalUnpaidFines = summaryData.fines
     .filter((f) => f.status === 'unpaid' || f.status === 'pending_approval')
     .reduce((acc, curr) => acc + (parseFloat(curr.amount) || 0), 0);
@@ -132,23 +150,49 @@ export default function StudentSummaryTab() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Left List */}
-        <div className="lg:col-span-4 bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden flex flex-col h-[700px]">
-          <div className="p-4 border-b border-slate-100 bg-slate-50/50">
-            <input
-              type="text"
-              placeholder="Search student name or ID..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#8b0000]/20 focus:border-[#8b0000]"
-            />
+        {/* Left List with Pagination */}
+        <div className="lg:col-span-4 bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden flex flex-col h-[720px]">
+          <div className="p-4 border-b border-slate-100 bg-slate-50/50 flex flex-col gap-3">
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="Search student name or ID..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-9 pr-4 py-2.5 bg-white border border-slate-200 rounded-xl text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#8b0000]/20 focus:border-[#8b0000]"
+              />
+              <svg className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+            </div>
+            
+            {/* Pagination Controls */}
+            <div className="flex justify-between items-center text-xs font-bold text-slate-600 px-1">
+              <button
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page === 0}
+                className="px-3 py-1 bg-white border border-slate-200 rounded-lg disabled:opacity-40 cursor-pointer shadow-sm"
+              >
+                Previous
+              </button>
+              <span>Page {page + 1}</span>
+              <button
+                onClick={() => setPage((p) => p + 1)}
+                disabled={students.length < pageSize}
+                className="px-3 py-1 bg-white border border-slate-200 rounded-lg disabled:opacity-40 cursor-pointer shadow-sm"
+              >
+                Next
+              </button>
+            </div>
           </div>
 
           <div className="divide-y divide-slate-100 overflow-y-auto flex-1">
-            {filteredStudents.length === 0 ? (
-              <div className="p-8 text-center text-xs font-bold text-slate-400 uppercase">No students found</div>
+            {listLoading ? (
+              <div className="p-12 text-center text-xs font-bold text-slate-400 uppercase tracking-wider">Loading students...</div>
+            ) : students.length === 0 ? (
+              <div className="p-12 text-center text-xs font-bold text-slate-400 uppercase tracking-wider">No students found</div>
             ) : (
-              filteredStudents.map((stu) => {
+              students.map((stu) => {
                 const isSelected = selectedStudent?.id === stu.id;
                 return (
                   <button
@@ -252,12 +296,18 @@ export default function StudentSummaryTab() {
                               </td>
                               <td className="px-5 py-3.5">
                                 {hasAttended ? (
-                                  <span className="inline-block px-2.5 py-1 bg-emerald-50 text-emerald-700 font-black text-[10px] uppercase rounded border border-emerald-200">
-                                    ✓ Present
+                                  <span className="inline-flex items-center gap-1 px-2.5 py-1 bg-emerald-50 text-emerald-700 font-black text-[10px] uppercase rounded border border-emerald-200">
+                                    <svg className="w-3 h-3 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                                    </svg>
+                                    Present
                                   </span>
                                 ) : (
-                                  <span className="inline-block px-2.5 py-1 bg-red-50 text-red-700 font-black text-[10px] uppercase rounded border border-red-200">
-                                    ✕ Absent
+                                  <span className="inline-flex items-center gap-1 px-2.5 py-1 bg-red-50 text-red-700 font-black text-[10px] uppercase rounded border border-red-200">
+                                    <svg className="w-3 h-3 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M6 18L18 6M6 6l12 12" />
+                                    </svg>
+                                    Absent
                                   </span>
                                 )}
                               </td>

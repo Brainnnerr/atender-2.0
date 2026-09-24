@@ -1,80 +1,82 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useTransition } from 'react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { supabase } from '../../lib/supabaseClient';
 import { logAdminAction } from '../../lib/auditLogger';
 import fcoLogo from '../../assets/FCO-LOGOO.png';
-import essuLogo from '../../assets/essu-logo-mini.png';
 
 export default function FineManagementTab({ currentUser }) {
   const [fines, setFines] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
   
   // Advanced dropdown filter states
   const [programFilter, setProgramFilter] = useState('ALL');
   const [yearFilter, setYearFilter] = useState('ALL');
   const [sectionFilter, setSectionFilter] = useState('ALL');
-  const [semesterFilter, setSemesterFilter] = useState('1st Semester'); // Default to 1st Semester
+  const [semesterFilter, setSemesterFilter] = useState('1st Semester');
+
+  // Pagination states
+  const [page, setPage] = useState(0);
+  const pageSize = 25;
+  const [, startTransition] = useTransition();
 
   const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
   
   // PDF Preview Modal States
   const [pdfPreviewModalOpen, setPdfPreviewModalOpen] = useState(false);
   const [pdfPreviewUrl, setPdfPreviewUrl] = useState(null);
-  const [pdfDocInstance, setPdfDocInstance] = useState(null);
   
   // Remarks Modal States
   const [remarksModalOpen, setRemarksModalOpen] = useState(false);
   const [selectedStudentForAction, setSelectedStudentForAction] = useState(null);
   const [selectedRemark, setSelectedRemark] = useState('Member');
 
+  // Debounce search query
   useEffect(() => {
-    fetchStudentFinesMasterlist();
-  }, [semesterFilter]); // Re-fetch or re-filter when semester changes
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchQuery);
+      setPage(0);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    fetchPaginatedFinesMasterlist();
+  }, [semesterFilter, statusFilter, programFilter, yearFilter, sectionFilter, debouncedSearch, page]);
 
   const showToast = (message, type = 'success') => {
     setToast({ show: true, message, type });
     setTimeout(() => setToast({ show: false, message: '', type: 'success' }), 3500);
   };
 
-  const fetchStudentFinesMasterlist = async () => {
+  const fetchPaginatedFinesMasterlist = async () => {
     try {
       setLoading(true);
-      
-      // 1. Fetch all students
-      const { data: students, error: studErr } = await supabase
-        .from('profiles')
-        .select('id, full_name, student_id, year_level, section, course')
-        .eq('role', 'student');
 
-      if (studErr) throw studErr;
+      const { data, error } = await supabase.rpc('get_paginated_fine_masterlist', {
+        p_semester: semesterFilter,
+        p_status: statusFilter,
+        p_program: programFilter,
+        p_year: yearFilter,
+        p_section: sectionFilter,
+        p_search: debouncedSearch,
+        p_limit: pageSize,
+        p_offset: page * pageSize,
+      });
 
-      // 2. Fetch all fines records along with parent event's semester property
-      const { data: finesData, error: fineErr } = await supabase
-        .from('fines')
-        .select('id, amount, status, remarks, student_id, event_id, events(semester)');
+      if (error) throw error;
 
-      if (fineErr) throw fineErr;
-
-      // 3. Aggregate fines per student filtered strictly by selected semester
-      const aggregatedList = students.map(student => {
-        const studentFines = (finesData || []).filter(f => {
-          if (f.student_id !== student.id) return false;
-          if (semesterFilter === 'ALL') return true;
-          const eventSemester = f.events?.semester || '1st Semester';
-          return eventSemester.toLowerCase() === semesterFilter.toLowerCase();
-        });
+      // Process and aggregate student fine items
+      const aggregatedList = (data || []).map(item => {
+        const studentFines = item.student_fines || [];
         
-        // Unpaid fines sum
         const unpaidFines = studentFines.filter(f => String(f.status || '').toLowerCase() === 'unpaid');
         const unpaidAmount = unpaidFines.reduce((sum, f) => sum + parseFloat(f.amount || 0), 0);
-
-        // Check if student has any paid fines to reflect collection history
         const hasPaidRecords = studentFines.some(f => String(f.status || '').toLowerCase() === 'paid');
 
-        // Determine aggregated status and display amount
         let status = 'unpaid';
         let displayAmount = unpaidAmount;
 
@@ -90,17 +92,32 @@ export default function FineManagementTab({ currentUser }) {
         const fineIds = studentFines.map(f => f.id);
 
         return {
-          studentId: student.id,
-          profiles: student,
+          studentId: item.student_id,
+          profiles: {
+            id: item.student_id,
+            full_name: item.full_name,
+            student_id: item.student_number,
+            course: item.course,
+            year_level: item.year_level,
+            section: item.section,
+          },
           fineIds: fineIds,
           amount: displayAmount,
           unpaidAmount: unpaidAmount,
           status: status,
-          remarks: remarks
+          remarks: remarks,
         };
       });
 
-      setFines(aggregatedList);
+      // Apply client-side status filter if specified
+      const finalFiltered = aggregatedList.filter(f => {
+        if (statusFilter === 'ALL') return true;
+        return f.status.toLowerCase() === statusFilter.toLowerCase();
+      });
+
+      startTransition(() => {
+        setFines(finalFiltered);
+      });
     } catch (err) {
       console.error('Error fetching masterlist:', err.message || err);
       showToast('Failed to load student records.', 'error');
@@ -120,7 +137,6 @@ export default function FineManagementTab({ currentUser }) {
     if (!selectedStudentForAction) return;
 
     try {
-      // 1. Mark the student's fine records as paid
       if (selectedStudentForAction.fineIds && selectedStudentForAction.fineIds.length > 0) {
         const { error } = await supabase
           .from('fines')
@@ -132,7 +148,6 @@ export default function FineManagementTab({ currentUser }) {
 
         if (error) throw error;
 
-        // 2. Fetch the event IDs tied to these fines so we can hide them from the student view
         const { data: fineRecords } = await supabase
           .from('fines')
           .select('event_id')
@@ -140,14 +155,11 @@ export default function FineManagementTab({ currentUser }) {
 
         const eventIdsToHide = [...new Set((fineRecords || []).map(f => f.event_id).filter(Boolean))];
 
-        // 3. Hide the associated event(s) from the student dashboard
         if (eventIdsToHide.length > 0) {
-          const { error: eventErr } = await supabase
+          await supabase
             .from('events')
             .update({ hidden_from_student: true })
             .in('id', eventIdsToHide);
-
-          if (eventErr) console.warn('Could not hide event from student:', eventErr);
         }
       }
 
@@ -163,39 +175,17 @@ export default function FineManagementTab({ currentUser }) {
 
       setRemarksModalOpen(false);
       setSelectedStudentForAction(null);
-      fetchStudentFinesMasterlist();
+      fetchPaginatedFinesMasterlist();
     } catch (err) {
       showToast(err.message || 'Operation failed.', 'error');
     }
   };
 
-  // Extract unique options for filter dropdowns
-  const uniquePrograms = ['ALL', ...new Set(fines.map(f => f.profiles?.course).filter(Boolean))];
-  const uniqueYears = ['ALL', ...new Set(fines.map(f => f.profiles?.year_level).filter(Boolean))];
-  const uniqueSections = ['ALL', ...new Set(fines.map(f => f.profiles?.section).filter(Boolean))];
-
-  // Filter pipeline
-  const filteredFines = fines.filter((f) => {
-    const student = f.profiles || {};
-    const matchesSearch =
-      (student.full_name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (student.student_id || '').toLowerCase().includes(searchQuery.toLowerCase());
-
-    const matchesStatus =
-      statusFilter === 'ALL' || f.status.toLowerCase() === statusFilter.toLowerCase();
-
-    const matchesProgram = programFilter === 'ALL' || student.course === programFilter;
-    const matchesYear = yearFilter === 'ALL' || String(student.year_level) === String(yearFilter);
-    const matchesSection = sectionFilter === 'ALL' || student.section === sectionFilter;
-
-    return matchesSearch && matchesStatus && matchesProgram && matchesYear && matchesSection;
-  });
-
-  const totalUnpaidAmount = filteredFines
+  const totalUnpaidAmount = fines
     .filter(f => f.status === 'unpaid')
     .reduce((sum, f) => sum + parseFloat(f.unpaidAmount || 0), 0);
 
-  const totalPaidAmount = filteredFines
+  const totalPaidAmount = fines
     .filter(f => f.status === 'paid')
     .reduce((sum, f) => sum + parseFloat(f.amount || 0), 0);
 
@@ -216,121 +206,80 @@ export default function FineManagementTab({ currentUser }) {
     }
   };
 
-  const buildPdfDocument = async () => {
-    const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
-    const pageWidth = doc.internal.pageSize.getWidth();
-
+ const buildPdfDocument = async () => {
+    const doc = new jsPDF();
     const base64Fco = await getBase64ImageFromUrl(fcoLogo);
-    if (base64Fco) {
-      doc.addImage(base64Fco, 'PNG', 45, 34, 46, 46);
-    }
+    
+    const generateTable = (docInstance) => {
+      // Header Section
+      docInstance.setFontSize(14);
+      docInstance.setTextColor(139, 0, 0);
+      docInstance.text('EASTERN SAMAR STATE UNIVERSITY', 36, 16);
+      
+      docInstance.setFontSize(10);
+      docInstance.setTextColor(100, 100, 100);
+      docInstance.text('FCO-COE STUDENT FINES REPORT', 36, 23);
 
-    const base64Essu = await getBase64ImageFromUrl(essuLogo);
-    if (base64Essu) {
-      doc.addImage(base64Essu, 'PNG', pageWidth - 45 - 46, 34, 46, 46);
-    }
+      docInstance.setFontSize(9);
+      docInstance.setTextColor(70, 70, 70);
+      docInstance.text(`Semester: ${semesterFilter} | Program: ${programFilter} | Year: ${yearFilter} | Section: ${sectionFilter}`, 14, 36);
+      docInstance.text(`Generated On: ${new Date().toLocaleDateString()} | Total Records: ${fines.length}`, 14, 43);
 
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(13);
-    doc.setTextColor(15, 23, 42);
-    doc.text('FEDERATED CLASS ORGANIZATION', pageWidth / 2, 48, { align: 'center' });
+      const tableColumns = ['No.', 'Student Number', 'Full Name', 'Program / Year & Sec', 'Status', 'Fine (PHP)'];
+      const tableRows = fines.map((f, index) => [
+        index + 1,
+        f.profiles?.student_id || 'N/A',
+        f.profiles?.full_name || 'Unknown',
+        `${f.profiles?.course || 'COE'} ${f.profiles?.year_level || ''}${f.profiles?.section || ''}`,
+        f.status.toUpperCase(),
+        `${parseFloat(f.status === 'unpaid' ? f.unpaidAmount : f.amount || 0).toFixed(2)}`,
+      ]);
 
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(8.5);
-    doc.setTextColor(30, 58, 138);
-    doc.text('COLLEGE OF ENGINEERING', pageWidth / 2, 60, { align: 'center' });
-
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(11);
-    doc.setTextColor(139, 0, 0);
-    doc.text('OFFICIAL STUDENT FINES & SANCTIONS AUDIT REPORT', pageWidth / 2, 80, { align: 'center' });
-
-    // Include the active semester filter in the metadata subheader
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8.5);
-    doc.setTextColor(71, 85, 105);
-    doc.text(`Semester: ${semesterFilter} | Scope: ${statusFilter} | Generated: ${new Date().toLocaleString()}`, pageWidth / 2, 93, { align: 'center' });
-
-    doc.setDrawColor(226, 232, 240);
-    doc.setFillColor(248, 250, 252);
-    doc.roundedRect(45, 108, pageWidth - 90, 26, 4, 4, 'FD');
-
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(8);
-    doc.setTextColor(15, 23, 42);
-    doc.text(`Total Students: ${filteredFines.length}`, 60, 124);
-    doc.setTextColor(220, 38, 38);
-    doc.text(`Unpaid Total: PHP ${totalUnpaidAmount.toFixed(2)}`, 200, 124);
-    doc.setTextColor(5, 150, 105);
-    doc.text(`Collected Total: PHP ${totalPaidAmount.toFixed(2)}`, 385, 124);
-
-    const tableColumns = [
-      { header: 'Student ID', dataKey: 'studentId' },
-      { header: 'Full Name', dataKey: 'fullName' },
-      { header: 'Program', dataKey: 'program' },
-      { header: 'Yr & Sec', dataKey: 'yearSec' },
-      { header: 'Remarks', dataKey: 'remarks' },
-      { header: 'Amount (PHP)', dataKey: 'amount' },
-      { header: 'Status', dataKey: 'status' },
-    ];
-
-    const tableRows = filteredFines.map((f) => ({
-      studentId: f.profiles?.student_id || 'N/A',
-      fullName: f.profiles?.full_name || 'Unknown',
-      program: f.profiles?.course || 'BSCpE',
-      yearSec: `${f.profiles?.year_level || ''}${f.profiles?.section || ''}`,
-      remarks: (f.remarks || 'Member').toUpperCase(),
-      amount: `PHP ${parseFloat(f.status === 'unpaid' ? f.unpaidAmount : f.amount || 0).toFixed(2)}`,
-      status: f.status.toUpperCase(),
-    }));
-
-    autoTable(doc, {
-      startY: 144,
-      margin: { left: 45, right: 45 },
-      columns: tableColumns,
-      body: tableRows,
-      theme: 'grid',
-      styles: {
-        fontSize: 8,
-        cellPadding: 4.5,
-        textColor: [51, 65, 85],
-        lineColor: [226, 232, 240],
-        lineWidth: 0.5,
-      },
-      headStyles: {
-        fillColor: [139, 0, 0],
-        textColor: [255, 255, 255],
-        fontStyle: 'bold',
-      },
-      alternateRowStyles: {
-        fillColor: [248, 250, 252],
-      },
-      columnStyles: {
-        studentId: { cellWidth: 70, font: 'courier', fontStyle: 'bold' },
-        fullName: { cellWidth: 130, fontStyle: 'bold' },
-        program: { cellWidth: 55, halign: 'center' },
-        yearSec: { cellWidth: 50, halign: 'center' },
-        remarks: { cellWidth: 65, halign: 'center', fontStyle: 'bold' },
-        amount: { cellWidth: 65, halign: 'right', fontStyle: 'bold', textColor: [139, 0, 0] },
-        status: { cellWidth: 87, halign: 'center', fontStyle: 'bold' },
-      },
-      didParseCell: function (data) {
-        if (data.section === 'body' && data.column.dataKey === 'status') {
-          if (data.cell.raw === 'PAID') {
-            data.cell.styles.textColor = [5, 150, 105];
-          } else {
-            data.cell.styles.textColor = [220, 38, 38];
+      autoTable(docInstance, {
+        head: [tableColumns],
+        body: tableRows,
+        startY: 50,
+        theme: 'grid',
+        margin: { left: 14, right: 14 },
+        headStyles: { 
+          fillColor: [139, 0, 0], 
+          textColor: [255, 255, 255], 
+          fontStyle: 'bold', 
+          fontSize: 8.5,
+          halign: 'center'
+        },
+        styles: { fontSize: 8, fontStyle: 'normal', cellPadding: 3, valign: 'middle' },
+        columnStyles: {
+          0: { cellWidth: 12, halign: 'left' }, // No.
+          1: { cellWidth: 34, halign: 'left' },   // Student Number
+          2: { cellWidth: 60, halign: 'left' },   // Full Name
+          3: { cellWidth: 30, halign: 'left' }, // Program / Year & Sec
+          4: { cellWidth: 23, halign: 'left', fontStyle: 'bold' }, // Status
+          5: { cellWidth: 23, halign: 'center', textColor: [139, 0, 0] }, // Fine (PHP)
+        },
+        didParseCell: function (data) {
+          if (data.section === 'body' && data.column.index === 4) {
+            if (data.cell.raw === 'PAID') {
+              data.cell.styles.textColor = [5, 150, 105];
+            } else {
+              data.cell.styles.textColor = [220, 38, 38];
+            }
           }
-        }
-      },
-    });
+        },
+      });
+    };
 
-    return doc;
+    return new Promise((resolve) => {
+      if (base64Fco) {
+        doc.addImage(base64Fco, 'PNG', 14, 10, 18, 18);
+      }
+      generateTable(doc);
+      resolve(doc);
+    });
   };
 
   const handleOpenPdfPreview = async () => {
     const doc = await buildPdfDocument();
-    setPdfDocInstance(doc);
     const pdfBlobUrl = doc.output('bloburl');
     setPdfPreviewUrl(pdfBlobUrl);
     setPdfPreviewModalOpen(true);
@@ -338,14 +287,14 @@ export default function FineManagementTab({ currentUser }) {
 
   const handleDownloadPDF = async () => {
     try {
-      const doc = pdfDocInstance || (await buildPdfDocument());
-      doc.save(`Student_Fines_Audit_Report_${semesterFilter.replace(/\s+/g, '_')}_${new Date().toISOString().slice(0, 10)}.pdf`);
+      const doc = await buildPdfDocument();
+      doc.save(`Student_Fines_Report_${semesterFilter.replace(/\s+/g, '_')}.pdf`);
 
       await logAdminAction({
         currentUser,
         actionType: 'EXPORT_AUDIT_REPORT',
         module: 'FINES',
-        details: { export_format: 'PDF', semester: semesterFilter, total_records: filteredFines.length },
+        details: { export_format: 'PDF', semester: semesterFilter, total_records: fines.length },
       });
     } catch (err) {
       console.error('Error downloading PDF:', err);
@@ -387,11 +336,11 @@ export default function FineManagementTab({ currentUser }) {
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-black text-slate-800 tracking-tight">Student Fine & Sanction Management</h2>
             <span className="px-3 py-1 bg-red-50 text-[#8b0000] border border-red-200 rounded-full text-[10px] font-black uppercase tracking-wider">
-              📅 {semesterFilter}
+              {semesterFilter}
             </span>
           </div>
           <p className="text-xs text-slate-500 font-medium mt-0.5">
-            Manage student compliance, filter by program/year/section, and download vectorized PDF audit reports.
+            Manage student compliance, filter by program/year/section, and preview/download PDF audit reports.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -431,9 +380,9 @@ export default function FineManagementTab({ currentUser }) {
             className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 uppercase cursor-pointer"
           >
             <option value="ALL">Program: All</option>
-            {uniquePrograms.filter(p => p !== 'ALL').map(p => (
-              <option key={p} value={p}>{p}</option>
-            ))}
+            <option value="BSCE">BSCE</option>
+            <option value="BSEE">BSEE</option>
+            <option value="BSCpE">BSCpE</option>
           </select>
 
           {/* Year Level Dropdown Filter */}
@@ -443,9 +392,10 @@ export default function FineManagementTab({ currentUser }) {
             className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 uppercase cursor-pointer"
           >
             <option value="ALL">Year: All</option>
-            {uniqueYears.filter(y => y !== 'ALL').map(y => (
-              <option key={y} value={y}>Year {y}</option>
-            ))}
+            <option value="1">Year 1</option>
+            <option value="2">Year 2</option>
+            <option value="3">Year 3</option>
+            <option value="4">Year 4</option>
           </select>
 
           {/* Section Dropdown Filter */}
@@ -455,9 +405,10 @@ export default function FineManagementTab({ currentUser }) {
             className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 uppercase cursor-pointer"
           >
             <option value="ALL">Section: All</option>
-            {uniqueSections.filter(s => s !== 'ALL').map(s => (
-              <option key={s} value={s}>Section {s}</option>
-            ))}
+            <option value="A">Section A</option>
+            <option value="B">Section B</option>
+            <option value="C">Section C</option>
+            <option value="D">Section D</option>
           </select>
 
           {/* Semester Filter Dropdown */}
@@ -491,6 +442,29 @@ export default function FineManagementTab({ currentUser }) {
 
       {/* FINES TABLE */}
       <div className="bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden">
+        {/* Pagination Bar */}
+        <div className="flex justify-between items-center p-4 border-b border-slate-100 print:hidden bg-slate-50/50">
+          <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+            Showing Page {page + 1}
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0}
+              className="px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-700 disabled:opacity-40 cursor-pointer shadow-sm"
+            >
+              Previous
+            </button>
+            <button
+              onClick={() => setPage((p) => p + 1)}
+              disabled={fines.length < pageSize}
+              className="px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-700 disabled:opacity-40 cursor-pointer shadow-sm"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+
         {loading ? (
           <div className="p-12 text-center text-xs font-bold text-slate-400 uppercase tracking-wider">
             Loading student masterlist for {semesterFilter}...
@@ -508,14 +482,14 @@ export default function FineManagementTab({ currentUser }) {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 font-medium text-xs">
-                {filteredFines.length === 0 ? (
+                {fines.length === 0 ? (
                   <tr>
                     <td colSpan="5" className="px-6 py-12 text-center text-slate-400 font-bold uppercase tracking-wider">
                       No student records found matching your filters for {semesterFilter}.
                     </td>
                   </tr>
                 ) : (
-                  filteredFines.map((f) => {
+                  fines.map((f) => {
                     const student = f.profiles || {};
                     const isPaid = f.status === 'paid';
                     const amountVal = parseFloat(f.status === 'unpaid' ? f.unpaidAmount : f.amount || 0);
@@ -576,34 +550,34 @@ export default function FineManagementTab({ currentUser }) {
             </p>
 
             <div className="space-y-2 py-2 max-h-60 overflow-y-auto pr-1">
-  {[
-    'Member',
-    'Athlete',
-    "Dean's Lister",
-    'Officer',
-    'President Lister',
-    'IIEE Officer',
-    'FCO Officer',
-    'ICPEP Officer',
-    'PICE Officer',
-    'Sub-Org Committee',
-    'FCO Committee',
-    'Publication (Algorithm)',
-    'Others'
-  ].map((rem) => (
-    <label key={rem} className="flex items-center gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-100 transition">
-      <input
-        type="radio"
-        name="studentRemark"
-        value={rem}
-        checked={selectedRemark === rem}
-        onChange={(e) => setSelectedRemark(e.target.value)}
-        className="text-[#8b0000] focus:ring-[#8b0000]"
-      />
-      <span className="text-xs font-bold text-slate-800 uppercase">{rem}</span>
-    </label>
-  ))}
-</div>
+              {[
+                'Member',
+                'Athlete',
+                "Dean's Lister",
+                'Officer',
+                'President Lister',
+                'IIEE Officer',
+                'FCO Officer',
+                'ICPEP Officer',
+                'PICE Officer',
+                'Sub-Org Committee',
+                'FCO Committee',
+                'Publication (Algorithm)',
+                'Others'
+              ].map((rem) => (
+                <label key={rem} className="flex items-center gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-100 transition">
+                  <input
+                    type="radio"
+                    name="studentRemark"
+                    value={rem}
+                    checked={selectedRemark === rem}
+                    onChange={(e) => setSelectedRemark(e.target.value)}
+                    className="text-[#8b0000] focus:ring-[#8b0000]"
+                  />
+                  <span className="text-xs font-bold text-slate-800 uppercase">{rem}</span>
+                </label>
+              ))}
+            </div>
 
             <div className="flex gap-2 pt-2">
               <button

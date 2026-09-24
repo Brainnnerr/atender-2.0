@@ -6,9 +6,20 @@ export default function MasterlistTab({ students = [] }) {
   const [selectedYear, setSelectedYear] = useState('ALL');
   const [selectedSection, setSelectedSection] = useState('ALL');
 
-  // Extract unique year levels and sections dynamically from data for dropdown options
-  const uniqueYears = ['ALL', ...new Set(students.map(s => s.year_level).filter(Boolean))].sort();
+  // Extract unique year levels dynamically and sort them numerically
+  const uniqueYears = ['ALL', ...new Set(students.map(s => s.year_level).filter(Boolean))].sort((a, b) => Number(a) - Number(b));
   const uniqueSections = ['ALL', ...new Set(students.map(s => s.section).filter(Boolean))].sort();
+
+  // Helper to format year numbers into proper ordinals (1 -> 1st Year, 2 -> 2nd Year, etc.)
+  const formatYearLabel = (yr) => {
+    if (yr === 'ALL') return 'All Years';
+    const num = Number(yr);
+    if (num === 1) return '1st Year';
+    if (num === 2) return '2nd Year';
+    if (num === 3) return '3rd Year';
+    if (num === 4) return '4th Year';
+    return `${yr}th Year`;
+  };
 
   // Filter students based on search query, selected year level, and section
   const filteredStudents = students.filter(s => {
@@ -31,7 +42,7 @@ export default function MasterlistTab({ students = [] }) {
       return;
     }
 
-    const filterDescription = `Year: ${selectedYear === 'ALL' ? 'All Years' : selectedYear + 'th Year'} | Section: ${selectedSection === 'ALL' ? 'All Sections' : selectedSection}`;
+    const filterDescription = `Year: ${selectedYear === 'ALL' ? 'All Years' : formatYearLabel(selectedYear)} | Section: ${selectedSection === 'ALL' ? 'All Sections' : selectedSection}`;
 
     const htmlContent = `
       <!DOCTYPE html>
@@ -40,7 +51,7 @@ export default function MasterlistTab({ students = [] }) {
           <title>PICE Student Masterlist Roster</title>
           <style>
             @page {
-              size: A4 portrait; /* Automatically accommodates A4 and Long paper layouts */
+              size: A4 portrait;
               margin: 15mm;
             }
             body { 
@@ -261,7 +272,7 @@ export default function MasterlistTab({ students = [] }) {
             }}
           >
             {uniqueYears.map(yr => (
-              <option key={yr} value={yr}>{yr === 'ALL' ? 'All Years' : `${yr}th Year`}</option>
+              <option key={yr} value={yr}>{formatYearLabel(yr)}</option>
             ))}
           </select>
         </div>

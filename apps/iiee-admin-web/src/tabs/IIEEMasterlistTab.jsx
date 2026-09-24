@@ -1,29 +1,53 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useDeferredValue } from 'react';
 import { Users, Download, Search, Filter } from 'lucide-react';
 import { supabase } from '../services/supabase';
+
+const PAGE_SIZE = 15;
 
 export default function IIEEMasterlistTab() {
   const [students, setStudents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
+  const deferredQuery = useDeferredValue(searchQuery);
   const [selectedYear, setSelectedYear] = useState('ALL');
   const [selectedSection, setSelectedSection] = useState('ALL');
+  
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
 
   useEffect(() => {
-    fetchIIEEStudents();
-  }, []);
+    setPage(0);
+    fetchIIEEStudentsPage(0, deferredQuery, selectedYear, selectedSection, true);
+  }, [deferredQuery, selectedYear, selectedSection]);
 
-  async function fetchIIEEStudents() {
+  async function fetchIIEEStudentsPage(pageIndex = 0, query = '', year = 'ALL', section = 'ALL', reset = false) {
     try {
       setLoading(true);
-      const { data, error } = await supabase
+      let dbQuery = supabase
         .from('profiles')
         .select('*')
-        .or('course.ilike.%BSEE%,course.ilike.%ELECTRICAL%');
+        .or('course.ilike.%BSEE%,course.ilike.%ELECTRICAL%')
+        .order('full_name', { ascending: true })
+        .range(pageIndex * PAGE_SIZE, (pageIndex + 1) * PAGE_SIZE - 1);
 
-      if (!error && data) {
-        setStudents(data);
+      if (query.trim()) {
+        dbQuery = dbQuery.or(`full_name.ilike.%${query}%,student_id.ilike.%${query}%,course.ilike.%${query}%`);
       }
+
+      if (year !== 'ALL') {
+        dbQuery = dbQuery.eq('year_level', year);
+      }
+
+      if (section !== 'ALL') {
+        dbQuery = dbQuery.ilike('section', section);
+      }
+
+      const { data, error } = await dbQuery;
+      if (error) throw error;
+
+      const newStudents = data || [];
+      setHasMore(newStudents.length === PAGE_SIZE);
+      setStudents(reset ? newStudents : [...students, ...newStudents]);
     } catch (err) {
       console.error('Error loading IIEE masterlist:', err);
     } finally {
@@ -31,23 +55,16 @@ export default function IIEEMasterlistTab() {
     }
   }
 
-  // Extract unique year levels and sections dynamically from data for dropdown options
-  const uniqueYears = ['ALL', ...new Set(students.map(s => s.year_level).filter(Boolean))].sort();
-  const uniqueSections = ['ALL', ...new Set(students.map(s => s.section).filter(Boolean))].sort();
-
-  // Filter students based on search query, selected year level, and section
-  const filteredStudents = students.filter(s => {
-    const query = searchQuery.toLowerCase();
-    const name = (s.full_name || '').toLowerCase();
-    const studentNo = (s.student_id || '').toLowerCase();
-    const course = (s.course || '').toLowerCase();
-
-    const matchesSearch = name.includes(query) || studentNo.includes(query) || course.includes(query);
-    const matchesYear = selectedYear === 'ALL' || String(s.year_level) === String(selectedYear);
-    const matchesSection = selectedSection === 'ALL' || String(s.section).toUpperCase() === String(selectedSection).toUpperCase();
-
-    return matchesSearch && matchesYear && matchesSection;
-  });
+  // Helper for proper ordinal suffixes (1st, 2nd, 3rd, 4th, etc.)
+  const formatYearLevel = (yr) => {
+    if (!yr) return 'N/A';
+    const num = parseInt(yr, 10);
+    if (isNaN(num)) return `${yr} Year`;
+    if (num === 1) return '1st Year';
+    if (num === 2) return '2nd Year';
+    if (num === 3) return '3rd Year';
+    return `${num}th Year`;
+  };
 
   const handleDownloadPDF = () => {
     const printWindow = window.open('', '_blank');
@@ -56,7 +73,7 @@ export default function IIEEMasterlistTab() {
       return;
     }
 
-    const filterDescription = `Year: ${selectedYear === 'ALL' ? 'All Years' : selectedYear + 'th Year'} | Section: ${selectedSection === 'ALL' ? 'All Sections' : selectedSection}`;
+    const filterDescription = `Year: ${selectedYear === 'ALL' ? 'All Years' : formatYearLevel(selectedYear)} | Section: ${selectedSection === 'ALL' ? 'All Sections' : selectedSection}`;
 
     const htmlContent = `
       <!DOCTYPE html>
@@ -155,7 +172,7 @@ export default function IIEEMasterlistTab() {
 
           <div class="meta">
             <span><strong>Filter Applied:</strong> ${filterDescription}</span>
-            <span><strong>Total Records:</strong> ${filteredStudents.length}</span>
+            <span><strong>Total Loaded Records:</strong> ${students.length}</span>
           </div>
 
           <table>
@@ -169,7 +186,7 @@ export default function IIEEMasterlistTab() {
               </tr>
             </thead>
             <tbody>
-              ${filteredStudents.map((s, idx) => `
+              ${students.map((s, idx) => `
                 <tr>
                   <td>${idx + 1}</td>
                   <td><strong>${s.full_name || 'N/A'}</strong></td>
@@ -237,16 +254,15 @@ export default function IIEEMasterlistTab() {
           </div>
           <div>
             <div style={{ fontSize: '24px', fontWeight: '900', color: '#0f172a' }}>
-              {loading ? '...' : filteredStudents.length} <span style={{ fontSize: '13px', fontWeight: '600', color: '#64748b' }}>/ {students.length}</span>
+              {students.length} <span style={{ fontSize: '13px', fontWeight: '600', color: '#64748b' }}>Students</span>
             </div>
-            <div style={{ fontSize: '11px', fontWeight: '800', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Matching Students</div>
+            <div style={{ fontSize: '11px', fontWeight: '800', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Registry Records</div>
           </div>
         </div>
       </div>
 
       {/* Search & Dropdown Filters Bar */}
       <div style={{ display: 'flex', gap: '12px', marginBottom: '20px', flexWrap: 'wrap' }}>
-        {/* Search Input */}
         <div style={{ flex: 1, minWidth: '240px', position: 'relative' }}>
           <span style={{ position: 'absolute', left: '14px', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }}>
             <Search size={16} />
@@ -269,27 +285,20 @@ export default function IIEEMasterlistTab() {
           />
         </div>
 
-        {/* Year Level Dropdown */}
+        {/* Year Level Dropdown with proper ordinal suffix */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#ffffff', padding: '0 12px', borderRadius: '10px', border: '1px solid #cbd5e1' }}>
           <Filter size={14} color="#64748b" />
           <span style={{ fontSize: '11px', fontWeight: '800', color: '#64748b', textTransform: 'uppercase' }}>Year:</span>
           <select 
             value={selectedYear}
             onChange={(e) => setSelectedYear(e.target.value)}
-            style={{
-              padding: '10px 4px',
-              border: 'none',
-              fontSize: '13px',
-              fontWeight: '700',
-              color: '#0f172a',
-              backgroundColor: 'transparent',
-              outline: 'none',
-              cursor: 'pointer'
-            }}
+            style={{ padding: '10px 4px', border: 'none', fontSize: '13px', fontWeight: '700', color: '#0f172a', backgroundColor: 'transparent', outline: 'none', cursor: 'pointer' }}
           >
-            {uniqueYears.map(yr => (
-              <option key={yr} value={yr}>{yr === 'ALL' ? 'All Years' : `${yr}th Year`}</option>
-            ))}
+            <option value="ALL">All Years</option>
+            <option value="1">1st Year</option>
+            <option value="2">2nd Year</option>
+            <option value="3">3rd Year</option>
+            <option value="4">4th Year</option>
           </select>
         </div>
 
@@ -300,20 +309,12 @@ export default function IIEEMasterlistTab() {
           <select 
             value={selectedSection}
             onChange={(e) => setSelectedSection(e.target.value)}
-            style={{
-              padding: '10px 4px',
-              border: 'none',
-              fontSize: '13px',
-              fontWeight: '700',
-              color: '#0f172a',
-              backgroundColor: 'transparent',
-              outline: 'none',
-              cursor: 'pointer'
-            }}
+            style={{ padding: '10px 4px', border: 'none', fontSize: '13px', fontWeight: '700', color: '#0f172a', backgroundColor: 'transparent', outline: 'none', cursor: 'pointer' }}
           >
-            {uniqueSections.map(sec => (
-              <option key={sec} value={sec}>{sec === 'ALL' ? 'All Sections' : `Section ${sec}`}</option>
-            ))}
+            <option value="ALL">All Sections</option>
+            <option value="A">Section A</option>
+            <option value="B">Section B</option>
+            <option value="C">Section C</option>
           </select>
         </div>
       </div>
@@ -330,20 +331,20 @@ export default function IIEEMasterlistTab() {
             </tr>
           </thead>
           <tbody>
-            {loading ? (
+            {loading && students.length === 0 ? (
               <tr>
                 <td colSpan="4" style={{ textAlign: 'center', padding: '40px', color: '#64748b', fontWeight: '600' }}>
                   Loading IIEE student records...
                 </td>
               </tr>
-            ) : filteredStudents.length === 0 ? (
+            ) : students.length === 0 ? (
               <tr>
                 <td colSpan="4" style={{ textAlign: 'center', padding: '40px', color: '#64748b', fontWeight: '600' }}>
                   No student records found matching your filter criteria.
                 </td>
               </tr>
             ) : (
-              filteredStudents.map(s => (
+              students.map(s => (
                 <tr key={s.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
                   <td style={{ padding: '14px 20px', fontWeight: '700', color: '#0f172a' }}>
                     {s.full_name || 'Unnamed Student'}
@@ -355,13 +356,29 @@ export default function IIEEMasterlistTab() {
                     {s.course || 'Electrical Engineering'}
                   </td>
                   <td style={{ padding: '14px 16px', color: '#334155', fontWeight: '600' }}>
-                    {s.year_level ? `${s.year_level}${s.section || ''}` : 'N/A'}
+                    {s.year_level ? `${formatYearLevel(s.year_level).replace(' Year', '')} ${s.section || ''}` : 'N/A'}
                   </td>
                 </tr>
               ))
             )}
           </tbody>
         </table>
+
+        {/* Load More Pagination Trigger */}
+        {hasMore && !loading && (
+          <div style={{ padding: '16px', textAlign: 'center', backgroundColor: '#f8fafc', borderTop: '1px solid #e2e8f0' }}>
+            <button
+              onClick={() => {
+                const nextPage = page + 1;
+                setPage(nextPage);
+                fetchIIEEStudentsPage(nextPage, deferredQuery, selectedYear, selectedSection, false);
+              }}
+              style={{ backgroundColor: '#854d0e', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: '8px', fontSize: '11px', fontWeight: '800', cursor: 'pointer', textTransform: 'uppercase' }}
+            >
+              Load More Students
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

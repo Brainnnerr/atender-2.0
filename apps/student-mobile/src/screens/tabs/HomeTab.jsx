@@ -43,7 +43,7 @@ export default function HomeTab({
     subOrgName = 'Institute of Integrated Electrical Engineers';
     subOrgCode = 'IIEE FINES';
     subOrgColor = '#854d0e';
-    subOrgCardBg = '#ffffff'; // Uniform clean white theme matching PICE and FCO
+    subOrgCardBg = '#ffffff'; 
     subOrgBorderColor = '#e2e8f0';
     subOrgBadgeBg = 'rgba(133, 77, 14, 0.15)';
   } else if (course.includes('BSCpE') || course.includes('COMPUTER')) {
@@ -51,12 +51,31 @@ export default function HomeTab({
     subOrgCode = '';
   }
 
-  // Filter sub-org events strictly by student department course capability
+  // Filter sub-org events: Kapag ang subOrgFines ay 0 na (ibig sabihin nabayaran/na-mark as paid na ng admin), 
+  // o kaya ay may attendance na, itatago na natin ang mga ito sa HomeTab para hindi na makita ng estudyante.
   const studentFilteredSubEvents = subOrgEvents.filter((evt) => {
     const orgTarget = (evt.organization_type || evt.target_department || '').toUpperCase();
-    if (course.includes('BSCE') && (orgTarget.includes('PICE') || orgTarget.includes('BSCE'))) return true;
-    if (course.includes('BSEE') && (orgTarget.includes('IIEE') || orgTarget.includes('BSEE'))) return true;
-    return !orgTarget || orgTarget === 'ALL';
+    const isMatchedCourse = 
+      (course.includes('BSCE') && (orgTarget.includes('PICE') || orgTarget.includes('BSCE'))) ||
+      (course.includes('BSEE') && (orgTarget.includes('IIEE') || orgTarget.includes('BSEE'))) ||
+      (!orgTarget || orgTarget === 'ALL');
+
+    if (!isMatchedCourse) return false;
+
+    // 🚀 KUNG ANG TOTAL SUB-ORG FINES AY 0 NA (Nalinis/Na-mark as paid na ng admin), itago na ang lahat ng events
+    if (subOrgFines <= 0) {
+      return false;
+    }
+
+    // O kaya kung may attendance log na (Logged)
+    const attLog = subOrgAttendance[evt.id];
+    const hasAttended = !!(attLog?.time_in || attLog?.time_out || attLog?.status === 'present');
+
+    if (hasAttended) {
+      return false;
+    }
+
+    return true;
   });
 
   return (
@@ -101,7 +120,7 @@ export default function HomeTab({
         </Text>
       </View>
 
-      {/* 2. Department Sub-Organization Fines Card (Fully Matched to FCO Layout) */}
+      {/* 2. Department Sub-Organization Fines Card */}
       {subOrgCode ? (
         <View style={[styles.fineCard, { backgroundColor: subOrgCardBg, borderColor: subOrgBorderColor, borderWidth: 1.5 }]}>
           <View style={styles.fineHeader}>
@@ -219,7 +238,7 @@ export default function HomeTab({
           {studentFilteredSubEvents.length === 0 ? (
             <View style={styles.emptyContainer}>
               <Ionicons name="calendar-outline" size={36} color="#94a3b8" />
-              <Text style={styles.emptyText}>No events for your department sub-org yet.</Text>
+              <Text style={styles.emptyText}>No pending events for your department sub-org.</Text>
             </View>
           ) : (
             studentFilteredSubEvents.map((evt) => {

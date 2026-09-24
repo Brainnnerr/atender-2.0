@@ -22,15 +22,11 @@ export default function ProfileTab({ profile, onProfileUpdated }) {
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // Pick Image from Device Gallery and convert to compressed Base64
   const handlePickAvatar = async () => {
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== 'granted') {
-        Alert.alert(
-          'Permission Required',
-          'Please allow access to your photo library to update your profile photo.'
-        );
+        Alert.alert('Permission Required', 'Please allow access to your photo library.');
         return;
       }
 
@@ -44,31 +40,44 @@ export default function ProfileTab({ profile, onProfileUpdated }) {
 
       if (!result.canceled && result.assets && result.assets.length > 0) {
         const asset = result.assets[0];
-        const formattedBase64 = `data:image/jpeg;base64,${asset.base64}`;
-
-        setAvatarUri(formattedBase64);
         setUploadingAvatar(true);
 
-        // Immediate database update for live sync to Admin Attendance
-        const { error } = await supabase
-          .from('profiles')
-          .update({
-            avatar_url: formattedBase64,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', profile.id);
+        const ext = asset.uri.split('.').pop().toLowerCase() || 'jpeg';
+        let formattedBase64 = asset.base64 
+          ? (asset.base64.startsWith('data:image') ? asset.base64 : `data:image/${ext};base64,${asset.base64}`)
+          : null;
+
+        if (!formattedBase64) {
+          const response = await fetch(asset.uri);
+          const blob = await response.blob();
+          formattedBase64 = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.readAsDataURL(blob);
+          });
+        }
+
+        setAvatarUri(formattedBase64);
+
+        // Safe RPC call with structured error response
+        const { data: res, error } = await supabase.rpc('student_update_profile', {
+          p_user_id: profile.id,
+          p_email: null,
+          p_avatar_url: formattedBase64,
+        });
 
         if (error) throw error;
+        if (res && res.success === false) {
+          throw new Error(res.message || 'Database rejected the avatar update.');
+        }
 
-        Alert.alert('Avatar Updated', 'Your profile picture has been synced to your attendance records.');
-        
-        // Pass the updated profile fields back up to StudentDashboard to refresh instantly
+        Alert.alert('Success', 'Profile picture updated successfully.');
         if (onProfileUpdated) {
           onProfileUpdated({ ...profile, avatar_url: formattedBase64 });
         }
       }
     } catch (err) {
-      Alert.alert('Upload Error', err.message || 'Could not update profile photo.');
+      Alert.alert('Update Error', err.message || 'Could not update profile photo.');
     } finally {
       setUploadingAvatar(false);
     }
@@ -82,24 +91,26 @@ export default function ProfileTab({ profile, onProfileUpdated }) {
 
     try {
       setSaving(true);
-      const { error } = await supabase
-        .from('profiles')
-        .update({
-          email: editEmail.trim().toLowerCase(),
-          avatar_url: avatarUri || null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', profile.id);
+      const cleanEmail = editEmail.trim().toLowerCase();
+
+      // Safe RPC call with structured error response
+      const { data: res, error } = await supabase.rpc('student_update_profile', {
+        p_user_id: profile.id,
+        p_email: cleanEmail,
+        p_avatar_url: null,
+      });
 
       if (error) throw error;
+      if (res && res.success === false) {
+        throw new Error(res.message || 'Database rejected the email update.');
+      }
 
-      Alert.alert('Success', 'Profile details updated successfully.');
-      
+      Alert.alert('Success', 'Email updated successfully.');
       if (onProfileUpdated) {
-        onProfileUpdated({ ...profile, email: editEmail.trim().toLowerCase(), avatar_url: avatarUri });
+        onProfileUpdated({ ...profile, email: cleanEmail });
       }
     } catch (err) {
-      Alert.alert('Update Failed', err.message || 'Unable to update profile.');
+      Alert.alert('Update Error', err.message || 'Unable to update email.');
     } finally {
       setSaving(false);
     }

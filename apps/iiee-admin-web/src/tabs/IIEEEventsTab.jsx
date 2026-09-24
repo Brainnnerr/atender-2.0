@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { supabase, IIEE_ORG_ID } from '../services/supabase';
+import { attendanceClient } from '../lib/attendanceClient';
 import { QrCode, PlusCircle, Search, Calendar, MapPin, Clock, AlertTriangle, ShieldAlert, CheckCircle2 } from 'lucide-react';
 
 export default function IIEEEventsTab() {
@@ -58,39 +59,80 @@ export default function IIEEEventsTab() {
     }, 3500);
   };
 
-  const fetchEvents = async () => {
+const fetchEvents = async () => {
     try {
       setLoading(true);
-      const { data, error } = await supabase
+      // 1. Fetch IIEE Events from secondary DB
+      const { data: eventsData, error } = await attendanceClient
         .from('iiee_events')
         .select('*')
         .eq('organization_id', IIEE_ORG_ID)
         .order('start_time', { ascending: false });
 
       if (error) throw error;
-      setEvents(data || []);
+      setEvents(eventsData || []);
 
-      if (data) {
-        for (const evt of data) {
+      // 2. Client-side automated fine generation for expired/past events
+      if (eventsData && eventsData.length > 0) {
+        // Fetch all student profiles from main FCO database
+        const { data: studentsData } = await supabase
+          .from('profiles')
+          .select('id, course');
+
+        // Filter students belonging to IIEE (BSEE / Electrical)
+        const iieeStudents = (studentsData || []).filter(s => {
+          const c = (s.course || '').toUpperCase();
+          return c.includes('BSEE') || c.includes('ELECTRICAL');
+        });
+
+        for (const evt of eventsData) {
           const now = new Date().getTime();
           const end = new Date(evt.end_time).getTime();
+
+          // Check if event has ended or was created in the past
           if (now > end) {
-            try {
-              await supabase.rpc('generate_iiee_expired_event_fines', { p_event_id: evt.id });
-            } catch (rpcErr) {
-              console.log('Fine generation background check error:', rpcErr);
+            // Fetch existing attendance for this event
+            const { data: attData } = await attendanceClient
+              .from('iiee_attendance')
+              .select('student_id')
+              .eq('event_id', evt.id);
+
+            const attendedStudentIds = new Set((attData || []).map(a => a.student_id));
+
+            // Fetch existing fines for this event
+            const { data: finesData } = await attendanceClient
+              .from('iiee_fines')
+              .select('student_id')
+              .eq('event_id', evt.id);
+
+            const finedStudentIds = new Set((finesData || []).map(f => f.student_id));
+
+            // Identify absentees who don't have a fine yet
+            for (const student of iieeStudents) {
+              if (!attendedStudentIds.has(student.id) && !finedStudentIds.has(student.id)) {
+                // Insert absence fine into secondary database
+                await attendanceClient
+                  .from('iiee_fines')
+                  .insert([{
+                    event_id: evt.id,
+                    student_id: student.id,
+                    amount: evt.fine_amount || 50.00,
+                    status: 'unpaid',
+                    remarks: 'Member (Auto-Generated)'
+                  }]);
+              }
             }
           }
         }
       }
     } catch (err) {
-      console.error('Error fetching IIEE events:', err);
+      console.error('Error fetching IIEE events or generating fines:', err);
       showToast('Failed to load IIEE events.', 'error');
     } finally {
       setLoading(false);
     }
   };
-
+  
   const getEventAccessStatus = (event) => {
     const now = currentTime.getTime();
     const start = new Date(event.start_time).getTime();
@@ -184,7 +226,7 @@ export default function IIEEEventsTab() {
       };
 
       if (isEditing) {
-        const { error } = await supabase
+        const { error } = await attendanceClient
           .from('iiee_events')
           .update(payload)
           .eq('id', selectedEventId)
@@ -193,7 +235,7 @@ export default function IIEEEventsTab() {
         if (error) throw error;
         showToast(`IIEE Event "${title}" updated successfully!`);
       } else {
-        const { error } = await supabase
+        const { error } = await attendanceClient
           .from('iiee_events')
           .insert([payload]);
 
@@ -215,14 +257,14 @@ export default function IIEEEventsTab() {
     try {
       showToast('Checking event records...', 'success');
 
-      const { count: attendanceCount, error: attErr } = await supabase
+      const { count: attendanceCount, error: attErr } = await attendanceClient
         .from('iiee_attendance')
         .select('*', { count: 'exact', head: true })
         .eq('event_id', event.id);
 
       if (attErr) throw attErr;
 
-      const { count: finesCount, error: finesErr } = await supabase
+      const { count: finesCount, error: finesErr } = await attendanceClient
         .from('iiee_fines')
         .select('*', { count: 'exact', head: true })
         .eq('event_id', event.id);
@@ -250,7 +292,7 @@ export default function IIEEEventsTab() {
 
     setDeleting(true);
     try {
-      const { error } = await supabase
+      const { error } = await attendanceClient
         .from('iiee_events')
         .delete()
         .eq('id', eventToDelete.id)
@@ -539,7 +581,7 @@ export default function IIEEEventsTab() {
         </div>
       )}
 
-     {/* 6. QR CODE PREVIEW & PRINT MODAL */}
+      {/* 6. QR CODE PREVIEW & PRINT MODAL */}
       {qrModalOpen && activeQrEvent && (
         <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 }}>
           <div style={{ backgroundColor: '#ffffff', borderRadius: '24px', maxWidth: '420px', width: '100%', padding: '32px', boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)' }}>

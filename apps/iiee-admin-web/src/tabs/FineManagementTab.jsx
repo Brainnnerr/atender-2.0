@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { supabase, IIEE_ORG_ID } from '../services/supabase';
+import { supabase, IIEE_ORG_ID } from '../services/supabase'; // Main FCO database for profiles
+import { attendanceClient } from '../lib/attendanceClient'; // Secondary database for IIEE tables
 import { 
   CheckCircle2, 
   AlertTriangle, 
@@ -10,8 +11,8 @@ import {
   Calendar, 
   Eye, 
   Download, 
-  CheckCircle,
-  DollarSign
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 
 const iieeLogoUrl = '/IIEE-BG.png';
@@ -27,7 +28,11 @@ export default function FineManagementTab({ currentUser }) {
   const [programFilter, setProgramFilter] = useState('ALL');
   const [yearFilter, setYearFilter] = useState('ALL');
   const [sectionFilter, setSectionFilter] = useState('ALL');
-  const [semesterFilter, setSemesterFilter] = useState('1st Semester'); // Default to 1st Semester
+  const [semesterFilter, setSemesterFilter] = useState('1st Semester');
+
+  // Pagination States (Lightning-fast chunks of 10 items)
+  const [currentPage, setCurrentPage] = useState(1);
+  const PAGE_SIZE = 10;
 
   const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
   
@@ -39,11 +44,21 @@ export default function FineManagementTab({ currentUser }) {
   // Remarks Modal States
   const [remarksModalOpen, setRemarksModalOpen] = useState(false);
   const [selectedStudentForAction, setSelectedStudentForAction] = useState(null);
-  const [selectedRemark, setSelectedRemark] = useState('Member');
+  const [selectedRemark, setSelectedRemark] = useState('');
 
   useEffect(() => {
     fetchStudentFinesMasterlist();
-  }, [semesterFilter]); // Re-fetch or re-filter when semester changes
+
+    const channel = attendanceClient
+      .channel('realtime_iiee_fines_master_sync')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'iiee_fines' }, () => fetchStudentFinesMasterlist())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'iiee_attendance' }, () => fetchStudentFinesMasterlist())
+      .subscribe();
+
+    return () => {
+      attendanceClient.removeChannel(channel);
+    };
+  }, [semesterFilter]);
 
   const showToast = (message, type = 'success') => {
     setToast({ show: true, message, type });
@@ -54,38 +69,36 @@ export default function FineManagementTab({ currentUser }) {
     try {
       setLoading(true);
       
-      // 1. Fetch BSEE Students
-      const { data: students, error: studErr } = await supabase
-        .from('profiles')
-        .select('id, full_name, student_id, year_level, section, course')
-        .or('course.ilike.%BSEE%,course.ilike.%ELECTRICAL%');
+      // 🚀 Optimized Parallel Fetching across databases
+      const [studentsRes, eventsRes, attRes, finesRes] = await Promise.all([
+        supabase
+          .from('profiles')
+          .select('id, full_name, student_id, year_level, section, course')
+          .or('course.ilike.%BSEE%,course.ilike.%ELECTRICAL%'),
+        attendanceClient
+          .from('iiee_events')
+          .select('id, title, end_time, fine_amount, semester')
+          .eq('organization_id', IIEE_ORG_ID),
+        attendanceClient
+          .from('iiee_attendance')
+          .select('student_id, event_id, time_in, status'),
+        attendanceClient
+          .from('iiee_fines')
+          .select('id, amount, status, remarks, student_id, event_id')
+      ]);
 
-      if (studErr) throw studErr;
+      if (studentsRes.error) throw studentsRes.error;
+      if (eventsRes.error) throw eventsRes.error;
+      if (attRes.error) throw attRes.error;
+      if (finesRes.error) throw finesRes.error;
 
-      // 2. Fetch all IIEE Events (with semester info)
-      const { data: eventsData, error: evErr } = await supabase
-        .from('iiee_events')
-        .select('id, title, end_time, fine_amount, semester')
-        .eq('organization_id', IIEE_ORG_ID);
+      const students = studentsRes.data || [];
+      const eventsData = eventsRes.data || [];
+      const attData = attRes.data || [];
+      const finesData = finesRes.data || [];
 
-      if (evErr) throw evErr;
-
-      // 3. Fetch IIEE Attendance logs
-      const { data: attData, error: attErr } = await supabase
-        .from('iiee_attendance')
-        .select('student_id, event_id, time_in, status');
-
-      if (attErr) throw attErr;
-
-      // 4. Fetch IIEE Fines records
-      const { data: finesData, error: fineErr } = await supabase
-        .from('iiee_fines')
-        .select('id, amount, status, remarks, student_id, event_id');
-
-      if (fineErr) throw fineErr;
-
-      const aggregatedList = (students || []).map(student => {
-        const semesterEvents = (eventsData || []).filter(evt => {
+      const aggregatedList = students.map(student => {
+        const semesterEvents = eventsData.filter(evt => {
           if (semesterFilter === 'ALL') return true;
           const sem = evt.semester || '1st Semester';
           return sem.toLowerCase() === semesterFilter.toLowerCase();
@@ -94,19 +107,19 @@ export default function FineManagementTab({ currentUser }) {
         let calculatedUnpaidAmount = 0;
         let calculatedPaidAmount = 0;
         let hasPaidRecords = false;
-        let studentRemarks = 'Member';
+        let studentRemarks = ''; 
         let studentFineIds = [];
         let missedEventsList = [];
 
         semesterEvents.forEach(evt => {
           const isClosed = new Date(evt.end_time).getTime() <= Date.now();
-          const hasAttended = (attData || []).some(a => 
+          const hasAttended = attData.some(a => 
             String(a.student_id) === String(student.id) && 
             String(a.event_id) === String(evt.id) && 
             (a.time_in || a.status === 'present')
           );
 
-          const existingFine = (finesData || []).find(f => 
+          const existingFine = finesData.find(f => 
             String(f.student_id) === String(student.id) && 
             String(f.event_id) === String(evt.id)
           );
@@ -115,7 +128,9 @@ export default function FineManagementTab({ currentUser }) {
 
           if (existingFine) {
             studentFineIds.push(existingFine.id);
-            if (existingFine.remarks) studentRemarks = existingFine.remarks;
+            if (existingFine.remarks && !existingFine.remarks.includes('Auto-Generated')) {
+              studentRemarks = existingFine.remarks;
+            }
             
             const statusStr = String(existingFine.status || '').toLowerCase();
             if (statusStr === 'paid') {
@@ -165,12 +180,11 @@ export default function FineManagementTab({ currentUser }) {
   const handleOpenRemarksModal = (studentRecord) => {
     if (parseFloat(studentRecord.unpaidAmount || 0) <= 0) return;
     setSelectedStudentForAction(studentRecord);
-    setSelectedRemark('Member');
+    setSelectedRemark(studentRecord.remarks && !studentRecord.remarks.includes('Auto-Generated') ? studentRecord.remarks : '');
     setRemarksModalOpen(true);
   };
 
-  // 🚀 FIXED: Upserts/Inserts exact event fine rows as 'paid' so student app hides them instantly
-const handleConfirmMarkPaid = async () => {
+  const handleConfirmMarkPaid = async () => {
     if (!selectedStudentForAction) return;
 
     try {
@@ -183,41 +197,37 @@ const handleConfirmMarkPaid = async () => {
         return;
       }
 
-      // Step 1: Update any existing fine records for this student and these events to 'paid'
-      const { error: updateErr } = await supabase
-        .from('iiee_fines') // Use 'pice_fines' for PICE
+      const { error: updateErr } = await attendanceClient
+        .from('iiee_fines')
         .update({ 
           status: 'paid', 
-          remarks: selectedRemark 
+          remarks: selectedRemark || null 
         })
         .eq('student_id', studentId)
         .in('event_id', missedEvents);
 
       if (updateErr) throw updateErr;
 
-      // Step 2: Fetch existing fine event_ids for this student to see which ones didn't have rows yet
-      const { data: existingFines } = await supabase
-        .from('iiee_fines') // Use 'pice_fines' for PICE
+      const { data: existingFines } = await attendanceClient
+        .from('iiee_fines')
         .select('event_id')
         .eq('student_id', studentId)
         .in('event_id', missedEvents);
 
       const existingEventIds = (existingFines || []).map(f => String(f.event_id));
-      
-      // Find events that still lack a fine row and insert them as 'paid'
       const missingEventIds = missedEvents.filter(id => !existingEventIds.includes(String(id)));
 
       if (missingEventIds.length > 0) {
         const insertPayloads = missingEventIds.map(eventId => ({
           student_id: studentId,
           event_id: eventId,
-          amount: 50.00, // standard event fine fallback amount
+          amount: 50.00,
           status: 'paid',
-          remarks: selectedRemark
+          remarks: selectedRemark || null
         }));
 
-        const { error: insertErr } = await supabase
-          .from('iiee_fines') // Use 'pice_fines' for PICE
+        const { error: insertErr } = await attendanceClient
+          .from('iiee_fines')
           .insert(insertPayloads);
 
         if (insertErr) throw insertErr;
@@ -251,6 +261,10 @@ const handleConfirmMarkPaid = async () => {
 
     return matchesSearch && matchesStatus && matchesProgram && matchesYear && matchesSection;
   });
+
+  // Pagination calculation
+  const totalPages = Math.ceil(filteredFines.length / PAGE_SIZE) || 1;
+  const paginatedFines = filteredFines.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
   const totalUnpaidAmount = filteredFines
     .filter(f => f.status === 'unpaid')
@@ -305,7 +319,7 @@ const handleConfirmMarkPaid = async () => {
 
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(8.5);
-    doc.setTextColor(30, 58, 138);
+    doc.setTextColor(15, 23, 42);
     doc.text('ESSU STUDENT CHAPTER • COLLEGE OF ENGINEERING', pageWidth / 2, 60, { align: 'center' });
 
     doc.setFont('helvetica', 'bold');
@@ -341,15 +355,18 @@ const handleConfirmMarkPaid = async () => {
       { header: 'Status', dataKey: 'status' },
     ];
 
-    const tableRows = filteredFines.map((f) => ({
-      studentId: f.profiles?.student_id || 'N/A',
-      fullName: f.profiles?.full_name || 'Unknown',
-      program: f.profiles?.course || 'BSEE',
-      yearSec: `${f.profiles?.year_level || ''}${f.profiles?.section || ''}`,
-      remarks: (f.remarks || 'Member').toUpperCase(),
-      amount: `PHP ${parseFloat(f.status === 'unpaid' ? f.unpaidAmount : f.amount || 0).toFixed(2)}`,
-      status: f.status.toUpperCase(),
-    }));
+    const tableRows = filteredFines.map((f) => {
+      const cleanRemark = f.remarks && !f.remarks.includes('Auto-Generated') ? f.remarks : '';
+      return {
+        studentId: f.profiles?.student_id || 'N/A',
+        fullName: f.profiles?.full_name || 'Unknown',
+        program: f.profiles?.course || 'BSEE',
+        yearSec: `${f.profiles?.year_level || ''}${f.profiles?.section || ''}`,
+        remarks: cleanRemark.toUpperCase(),
+        amount: `PHP ${parseFloat(f.status === 'unpaid' ? f.unpaidAmount : f.amount || 0).toFixed(2)}`,
+        status: f.status.toUpperCase(),
+      };
+    });
 
     autoTable(doc, {
       startY: 144,
@@ -368,11 +385,6 @@ const handleConfirmMarkPaid = async () => {
         remarks: { cellWidth: 65, halign: 'center', fontStyle: 'bold' },
         amount: { cellWidth: 65, halign: 'right', fontStyle: 'bold', textColor: [133, 77, 14] },
         status: { cellWidth: 87, halign: 'center', fontStyle: 'bold' },
-      },
-      didParseCell: function (data) {
-        if (data.section === 'body' && data.column.dataKey === 'status') {
-          data.cell.styles.textColor = data.cell.raw === 'PAID' ? [5, 150, 105] : [220, 38, 38];
-        }
       },
     });
 
@@ -404,7 +416,6 @@ const handleConfirmMarkPaid = async () => {
 
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', fontFamily: 'sans-serif' }}>
-      {/* Toast Notification */}
       {toast.show && (
         <div style={{ position: 'fixed', top: '24px', right: '24px', zIndex: 9999 }}>
           <div style={{
@@ -479,7 +490,7 @@ const handleConfirmMarkPaid = async () => {
             type="text"
             placeholder="Search BSEE student name or ID..."
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => { setSearchQuery(e.target.value); setCurrentPage(1); }}
             style={{ width: '100%', padding: '9px 12px 9px 34px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '12px', boxSizing: 'border-box', outline: 'none' }}
           />
           <Search size={14} color="#94a3b8" style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)' }} />
@@ -488,7 +499,7 @@ const handleConfirmMarkPaid = async () => {
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
           <select
             value={programFilter}
-            onChange={(e) => setProgramFilter(e.target.value)}
+            onChange={(e) => { setProgramFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Program: All</option>
@@ -499,7 +510,7 @@ const handleConfirmMarkPaid = async () => {
 
           <select
             value={yearFilter}
-            onChange={(e) => setYearFilter(e.target.value)}
+            onChange={(e) => { setYearFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Year: All</option>
@@ -510,7 +521,7 @@ const handleConfirmMarkPaid = async () => {
 
           <select
             value={sectionFilter}
-            onChange={(e) => setSectionFilter(e.target.value)}
+            onChange={(e) => { setSectionFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="ALL">Section: All</option>
@@ -521,7 +532,7 @@ const handleConfirmMarkPaid = async () => {
 
           <select
             value={semesterFilter}
-            onChange={(e) => setSemesterFilter(e.target.value)}
+            onChange={(e) => { setSemesterFilter(e.target.value); setCurrentPage(1); }}
             style={{ padding: '8px 10px', borderRadius: '8px', border: '1px solid #cbd5e1', fontSize: '11px', fontWeight: '600', color: '#334155', background: '#f8fafc', cursor: 'pointer' }}
           >
             <option value="1st Semester">1st Semester</option>
@@ -534,7 +545,7 @@ const handleConfirmMarkPaid = async () => {
             {['ALL', 'UNPAID', 'PAID'].map((st) => (
               <button
                 key={st}
-                onClick={() => setStatusFilter(st)}
+                onClick={() => { setStatusFilter(st); setCurrentPage(1); }}
                 style={{
                   padding: '5px 10px',
                   borderRadius: '6px',
@@ -554,7 +565,7 @@ const handleConfirmMarkPaid = async () => {
         </div>
       </div>
 
-      {/* FINES TABLE */}
+      {/* FINES TABLE WITH PAGINATION */}
       <div style={{ backgroundColor: '#ffffff', borderRadius: '16px', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
         {loading ? (
           <div style={{ padding: '48px', textAlign: 'center', fontSize: '11px', fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase' }}>
@@ -573,17 +584,18 @@ const handleConfirmMarkPaid = async () => {
                 </tr>
               </thead>
               <tbody>
-                {filteredFines.length === 0 ? (
+                {paginatedFines.length === 0 ? (
                   <tr>
                     <td colSpan="5" style={{ padding: '48px', textAlign: 'center', color: '#94a3b8', fontWeight: '700', textTransform: 'uppercase' }}>
                       No BSEE student records found matching your filters for {semesterFilter}.
                     </td>
                   </tr>
                 ) : (
-                  filteredFines.map((f) => {
+                  paginatedFines.map((f) => {
                     const student = f.profiles || {};
                     const isPaid = f.status === 'paid';
                     const amountVal = parseFloat(f.status === 'unpaid' ? f.unpaidAmount : f.amount || 0);
+                    const cleanRemark = f.remarks && !f.remarks.includes('Auto-Generated') ? f.remarks : '';
 
                     return (
                       <tr key={f.studentId} style={{ borderBottom: '1px solid #f1f5f9' }}>
@@ -592,9 +604,13 @@ const handleConfirmMarkPaid = async () => {
                           <p style={{ fontSize: '11px', color: '#64748b', margin: 0, fontFamily: 'monospace' }}>SN: {student.student_id || 'N/A'} • {student.course || 'BSEE'} {student.year_level}{student.section}</p>
                         </td>
                         <td style={{ padding: '14px 20px' }}>
-                          <span style={{ padding: '3px 8px', backgroundColor: '#f1f5f9', color: '#334155', borderRadius: '6px', fontSize: '10px', fontWeight: '700', textTransform: 'uppercase' }}>
-                            {f.remarks || 'Member'}
-                          </span>
+                          {cleanRemark ? (
+                            <span style={{ padding: '3px 8px', backgroundColor: '#f1f5f9', color: '#334155', borderRadius: '6px', fontSize: '10px', fontWeight: '700', textTransform: 'uppercase' }}>
+                              {cleanRemark}
+                            </span>
+                          ) : (
+                            <span style={{ color: '#cbd5e1', fontSize: '11px' }}>—</span>
+                          )}
                         </td>
                         <td style={{ padding: '14px 20px', fontWeight: '900', fontFamily: 'monospace', color: '#0f172a' }}>
                           ₱{amountVal.toFixed(2)}
@@ -633,6 +649,27 @@ const handleConfirmMarkPaid = async () => {
             </table>
           </div>
         )}
+
+        {/* PAGINATION BAR */}
+        <div style={{ padding: '12px 16px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f8fafc' }}>
+          <button
+            onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
+            disabled={currentPage === 1}
+            style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: currentPage === 1 ? '#f1f5f9' : '#fff', color: currentPage === 1 ? '#94a3b8' : '#334155', fontSize: '11px', fontWeight: '700', cursor: currentPage === 1 ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+          >
+            <ChevronLeft size={14} /> Prev
+          </button>
+          <span style={{ fontSize: '11px', fontWeight: '700', color: '#64748b' }}>
+            Page {currentPage} of {totalPages}
+          </span>
+          <button
+            onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
+            disabled={currentPage >= totalPages}
+            style={{ padding: '6px 12px', borderRadius: '8px', border: '1px solid #cbd5e1', background: currentPage >= totalPages ? '#f1f5f9' : '#fff', color: currentPage >= totalPages ? '#94a3b8' : '#334155', fontSize: '11px', fontWeight: '700', cursor: currentPage >= totalPages ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+          >
+            Next <ChevronRight size={14} />
+          </button>
+        </div>
       </div>
 
       {/* REMARKS SELECTION MODAL */}
@@ -644,6 +681,7 @@ const handleConfirmMarkPaid = async () => {
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '20px', overflowY: 'auto', flex: 1, paddingRight: '4px' }}>
               {[
+                '',
                 'Member',
                 'Athlete',
                 "Dean's Lister",
@@ -658,7 +696,7 @@ const handleConfirmMarkPaid = async () => {
                 'Publication (Algorithm)',
                 'Others'
               ].map((rem) => (
-                <label key={rem} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 12px', backgroundColor: '#f8fafc', borderRadius: '10px', border: '1px solid #e2e8f0', cursor: 'pointer', fontSize: '11px', fontWeight: '700', textTransform: 'uppercase' }}>
+                <label key={rem || 'none'} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 12px', backgroundColor: '#f8fafc', borderRadius: '10px', border: '1px solid #e2e8f0', cursor: 'pointer', fontSize: '11px', fontWeight: '700', textTransform: 'uppercase' }}>
                   <input
                     type="radio"
                     name="studentRemark"
@@ -666,7 +704,7 @@ const handleConfirmMarkPaid = async () => {
                     checked={selectedRemark === rem}
                     onChange={(e) => setSelectedRemark(e.target.value)}
                   />
-                  <span>{rem}</span>
+                  <span>{rem || '(No Remark / Blank)'}</span>
                 </label>
               ))}
             </div>

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { supabase, PICE_ORG_ID } from '../services/supabase';
+import { supabase } from '../services/supabase'; // 👈 Main FCO database where admin_accounts lives
+import { PICE_ORG_ID } from '../services/piceClient'; // 👈 PICE Organization UUID constant
 
 export default function LandingPage({ onLoginSuccess }) {
   const [email, setEmail] = useState('');
@@ -14,7 +15,7 @@ export default function LandingPage({ onLoginSuccess }) {
     setLoading(true);
 
     try {
-      // Use maybeSingle() to prevent unhandled exceptions on invalid logins
+      // Authenticate against the Main FCO database using maybeSingle()
       const { data, error } = await supabase
         .from('admin_accounts')
         .select('*')
@@ -55,7 +56,6 @@ export default function LandingPage({ onLoginSuccess }) {
           justify-content: space-between;
           padding: 0 80px;
           box-sizing: border-box;
-          /* Added "fixed" so the background perfectly locks to the viewport without white gaps */
           background: linear-gradient(rgba(45, 10, 15, 0.4), rgba(20, 5, 8, 0.5)), url("/COE-PIC.jpg") center center / cover no-repeat fixed;
           font-family: sans-serif;
         }

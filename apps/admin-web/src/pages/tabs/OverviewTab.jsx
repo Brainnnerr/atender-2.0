@@ -21,7 +21,7 @@ export default function OverviewTab() {
     try {
       setLoading(true);
 
-      // 1. Fetch events with optional semester filter
+      // 1. Fetch main FCO events with optional semester filter
       let eventsQuery = supabase
         .from('events')
         .select('*')
@@ -37,29 +37,30 @@ export default function OverviewTab() {
       const events = eventsData || [];
       const eventIds = events.map(e => e.id);
 
-      // 2. Fetch all student profiles for total department headcount
+      // 2. Fetch all student profiles for total department headcount from main DB
       const { data: studentsData, error: stuErr } = await supabase
         .from('profiles')
         .select('id, course, role')
         .eq('role', 'student');
+      
       if (stuErr) throw new Error(stuErr.message || 'Failed to fetch student profiles');
 
       const students = studentsData || [];
       const studentCourseMap = {};
       students.forEach(s => {
-        studentCourseMap[s.id] = s.course;
+        studentCourseMap[s.id] = s.course || 'BSCpE';
       });
 
-      // 3. Fetch attendance logs corresponding to active events
+      // 3. Fetch main FCO attendance logs corresponding to active events
       let attendance = [];
       if (eventIds.length > 0) {
         const { data: attData, error: attErr } = await supabase
           .from('attendance')
           .select('id, event_id, time_in, student_id')
           .in('event_id', eventIds);
+        
         if (attErr) throw new Error(attErr.message || 'Failed to fetch attendance records');
         
-        // Attach course information safely using our lookup map
         attendance = (attData || []).map(att => ({
           ...att,
           profiles: { course: studentCourseMap[att.student_id] || 'BSCpE' }
@@ -69,18 +70,19 @@ export default function OverviewTab() {
       // Calculate Department Headcounts
       const deptTotals = { BSCE: 0, BSEE: 0, BSCpE: 0 };
       students.forEach((s) => {
-        if (deptTotals[s.course] !== undefined) {
-          deptTotals[s.course] += 1;
-        }
+        const c = (s.course || '').toUpperCase();
+        if (c.includes('CIVIL') || c === 'BSCE') deptTotals.BSCE += 1;
+        else if (c.includes('ELECTRICAL') || c === 'BSEE') deptTotals.BSEE += 1;
+        else if (c.includes('COMPUTER') || c === 'BSCpE') deptTotals.BSCpE += 1;
       });
 
       // Calculate Department Turnout Counts in Attendance
       const deptTurnout = { BSCE: 0, BSEE: 0, BSCpE: 0 };
       attendance.forEach((att) => {
-        const c = att.profiles?.course;
-        if (deptTurnout[c] !== undefined) {
-          deptTurnout[c] += 1;
-        }
+        const c = (att.profiles?.course || '').toUpperCase();
+        if (c.includes('CIVIL') || c === 'BSCE') deptTurnout.BSCE += 1;
+        else if (c.includes('ELECTRICAL') || c === 'BSEE') deptTurnout.BSEE += 1;
+        else if (c.includes('COMPUTER') || c === 'BSCpE') deptTurnout.BSCpE += 1;
       });
 
       // Calculate Turnout Rate per Department (%)

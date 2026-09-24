@@ -1,20 +1,26 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useTransition } from 'react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { supabase } from '../../lib/supabaseClient';
 import fcoLogo from '../../assets/FCO-LOGOO.png';
-import essuLogo from '../../assets/essu-logo-mini.png';
 import { logAdminAction } from '../../lib/auditLogger';
 
 export default function ReportsTab({ currentUser }) {
   const [loading, setLoading] = useState(true);
   const [events, setEvents] = useState([]);
   const [selectedEventId, setSelectedEventId] = useState('ALL');
-  const [semesterFilter, setSemesterFilter] = useState('ALL'); // <--- Added Semester Filter State
+  const [semesterFilter, setSemesterFilter] = useState('ALL');
   const [programFilter, setProgramFilter] = useState('ALL');
   const [yearFilter, setYearFilter] = useState('ALL');
+  const [sectionFilter, setSectionFilter] = useState('ALL');
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [reportType, setReportType] = useState('ALL'); // 'ALL' | 'ATTENDANCE' | 'ABSENTEE'
+
+  // Pagination states
+  const [page, setPage] = useState(0);
+  const pageSize = 25;
+  const [, startTransition] = useTransition();
 
   // PDF Preview Modal States
   const [pdfPreviewModalOpen, setPdfPreviewModalOpen] = useState(false);
@@ -22,30 +28,40 @@ export default function ReportsTab({ currentUser }) {
   const [pdfDocInstance, setPdfDocInstance] = useState(null);
 
   // Master Raw State
-  const [students, setStudents] = useState([]);
+  const [paginatedStudents, setPaginatedStudents] = useState([]);
   const [attendance, setAttendance] = useState([]);
   const [fines, setFines] = useState([]);
 
+  // Debounce search query
   useEffect(() => {
-    fetchReportData();
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchQuery);
+      setPage(0);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    fetchEventsAndAuxData();
+  }, [semesterFilter]);
+
+  useEffect(() => {
+    fetchPaginatedReportData();
 
     const channel = supabase
       .channel('realtime_reports_master_sync')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance' }, () => fetchReportData())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'fines' }, () => fetchReportData())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'events' }, () => fetchReportData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'attendance' }, () => fetchPaginatedReportData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'fines' }, () => fetchPaginatedReportData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'events' }, () => fetchPaginatedReportData())
       .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [selectedEventId, semesterFilter]);
+  }, [selectedEventId, semesterFilter, debouncedSearch, programFilter, yearFilter, sectionFilter, page]);
 
-  const fetchReportData = async () => {
+  const fetchEventsAndAuxData = async () => {
     try {
-      setLoading(true);
-
-      // 1. Fetch Events with optional semester filter
       let eventsQuery = supabase
         .from('events')
         .select('*')
@@ -58,245 +74,213 @@ export default function ReportsTab({ currentUser }) {
       const { data: evData } = await eventsQuery;
       setEvents(evData || []);
 
-      // 2. Fetch Enrolled Students
-      const { data: stData } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('role', 'student')
-        .order('full_name', { ascending: true });
-      setStudents(stData || []);
-
-      // 3. Fetch Attendance Logs
-      const { data: attData } = await supabase
-        .from('attendance')
-        .select('*');
+      const { data: attData } = await supabase.from('attendance').select('*');
       setAttendance(attData || []);
 
-      // 4. Fetch Fines Table
-      const { data: fnData } = await supabase
-        .from('fines')
-        .select('*');
+      const { data: fnData } = await supabase.from('fines').select('*');
       setFines(fnData || []);
     } catch (err) {
-      console.error('Error compiling report data:', err);
+      console.error('Error fetching auxiliary data:', err);
+    }
+  };
+
+  const fetchPaginatedReportData = async () => {
+    try {
+      setLoading(true);
+
+      const { data, error } = await supabase.rpc('get_paginated_reports', {
+        p_semester: semesterFilter,
+        p_event_id: selectedEventId,
+        p_search: debouncedSearch,
+        p_program: programFilter,
+        p_year: yearFilter,
+        p_limit: pageSize,
+        p_offset: page * pageSize,
+      });
+
+      if (error) throw error;
+      
+      // Apply local section filtering if selected
+      const filtered = (data || []).filter(stu => {
+        if (sectionFilter === 'ALL') return true;
+        return String(stu.section || '').toLowerCase() === sectionFilter.toLowerCase();
+      });
+
+      startTransition(() => {
+        setPaginatedStudents(filtered);
+      });
+    } catch (err) {
+      console.error('Error fetching paginated reports:', err);
     } finally {
       setLoading(false);
     }
   };
 
-  // Helper to load Logo as Base64 for jsPDF
-  const getBase64ImageFromUrl = async (imageUrl) => {
-    try {
-      const res = await fetch(imageUrl);
-      const blob = await res.blob();
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
+  const compileRowsForStudents = (studentList) => {
+    return studentList.map((student) => {
+      const relevantEvents = selectedEventId === 'ALL'
+        ? events
+        : events.filter((e) => String(e.id) === String(selectedEventId));
+
+      const studentAttendance = attendance.filter((a) => {
+        const isThisStudent = String(a.student_id) === String(student.id);
+        const isTargetEvent = selectedEventId === 'ALL' || String(a.event_id) === String(selectedEventId);
+        const isInCurrentEventsList = events.some(e => String(e.id) === String(a.event_id));
+        return isThisStudent && isTargetEvent && isInCurrentEventsList && (a.time_in || a.status === 'present');
       });
-    } catch (e) {
-      console.warn('Could not load image as base64:', e);
-      return null;
-    }
+
+      const studentDbFines = fines.filter((f) => {
+        const isThisStudent = String(f.student_id) === String(student.id);
+        const isTargetEvent = selectedEventId === 'ALL' || String(f.event_id) === String(selectedEventId);
+        const isInCurrentEventsList = events.some(e => String(e.id) === String(f.event_id));
+        const isUnpaid = String(f.status || '').toLowerCase() === 'unpaid' || String(f.status || '').toLowerCase() === 'pending_approval';
+        return isThisStudent && isTargetEvent && isInCurrentEventsList && isUnpaid;
+      });
+
+      const isPresent = studentAttendance.length > 0;
+      const dbFineTotal = studentDbFines.reduce((sum, f) => sum + (parseFloat(f.amount) || 0), 0);
+
+      let calculatedAbsenceFine = 0;
+      relevantEvents.forEach((evt) => {
+        const isClosed = new Date(evt.end_time).getTime() <= Date.now() || evt.attendance_access === 'force_closed';
+        const hasAttendedThis = attendance.some((a) => String(a.student_id) === String(student.id) && String(a.event_id) === String(evt.id));
+        if (isClosed && !hasAttendedThis) {
+          calculatedAbsenceFine += parseFloat(evt.fine_amount || 0);
+        }
+      });
+
+      const unpaidFineTotal = Math.max(dbFineTotal, calculatedAbsenceFine);
+
+      return {
+        id: student.id,
+        studentId: student.student_id,
+        fullName: student.full_name,
+        course: student.course || 'COE',
+        yearLevel: student.year_level || '',
+        section: student.section || '',
+        isPresent,
+        unpaidFineTotal,
+        checkInTime: studentAttendance[0]?.time_in || studentAttendance[0]?.created_at || null,
+      };
+    });
   };
 
-  // Compile Comprehensive Attendance and Fine Audit Rows
-  const compiledRows = students.map((student) => {
-    const relevantEvents = selectedEventId === 'ALL'
-      ? events
-      : events.filter((e) => e.id === selectedEventId);
+  const compiledRows = compileRowsForStudents(paginatedStudents);
 
-    const studentAttendance = attendance.filter((a) => {
-      const isThisStudent = String(a.student_id) === String(student.id);
-      const isTargetEvent = selectedEventId === 'ALL' || String(a.event_id) === String(selectedEventId);
-      const isInCurrentEventsList = events.some(e => String(e.id) === String(a.event_id));
-      return isThisStudent && isTargetEvent && isInCurrentEventsList && (a.time_in || a.status === 'present');
-    });
-
-    const studentDbFines = fines.filter((f) => {
-      const isThisStudent = String(f.student_id) === String(student.id);
-      const isTargetEvent = selectedEventId === 'ALL' || String(f.event_id) === String(selectedEventId);
-      const isInCurrentEventsList = events.some(e => String(e.id) === String(f.event_id));
-      const isUnpaid = String(f.status || '').toLowerCase() === 'unpaid' || String(f.status || '').toLowerCase() === 'pending_approval';
-      return isThisStudent && isTargetEvent && isInCurrentEventsList && isUnpaid;
-    });
-
-    const isPresent = studentAttendance.length > 0;
-    const dbFineTotal = studentDbFines.reduce((sum, f) => sum + (parseFloat(f.amount) || 0), 0);
-
-    let calculatedAbsenceFine = 0;
-    relevantEvents.forEach((evt) => {
-      const isClosed = new Date(evt.end_time).getTime() <= Date.now() || evt.attendance_access === 'force_closed';
-      const hasAttendedThis = attendance.some((a) => String(a.student_id) === String(student.id) && String(a.event_id) === String(evt.id));
-      if (isClosed && !hasAttendedThis) {
-        calculatedAbsenceFine += parseFloat(evt.fine_amount || 0);
-      }
-    });
-
-    const unpaidFineTotal = Math.max(dbFineTotal, calculatedAbsenceFine);
-
-    return {
-      id: student.id,
-      studentId: student.student_id,
-      fullName: student.full_name,
-      course: student.course || 'COE',
-      yearLevel: student.year_level || '',
-      section: student.section || '',
-      isPresent,
-      unpaidFineTotal,
-      checkInTime: studentAttendance[0]?.time_in || studentAttendance[0]?.created_at || null,
-    };
-  });
-
-  // Filter Pipeline
   const filteredRows = compiledRows.filter((row) => {
-    const sName = (row.fullName || '').toLowerCase();
-    const sId = (row.studentId || '').toLowerCase();
-    const q = searchQuery.toLowerCase().trim();
-
-    const matchesSearch = sName.includes(q) || sId.includes(q);
-    const matchesProgram = programFilter === 'ALL' || row.course === programFilter;
-    const matchesYear = yearFilter === 'ALL' || String(row.yearLevel) === yearFilter;
-
-    if (reportType === 'ATTENDANCE') {
-      return matchesSearch && matchesProgram && matchesYear && row.isPresent;
-    } else if (reportType === 'ABSENTEE') {
-      return matchesSearch && matchesProgram && matchesYear && !row.isPresent;
-    }
-    return matchesSearch && matchesProgram && matchesYear;
+    if (reportType === 'ATTENDANCE') return row.isPresent;
+    if (reportType === 'ABSENTEE') return !row.isPresent;
+    return true;
   });
 
-  // Summary Metrics
   const totalReportStudents = filteredRows.length;
   const totalPresent = filteredRows.filter((r) => r.isPresent).length;
   const totalAbsent = totalReportStudents - totalPresent;
   const totalOutstanding = filteredRows.reduce((sum, r) => sum + r.unpaidFineTotal, 0);
 
-  // Generate jsPDF Document Builder with Left (FCO) and Right (ESSU) Logos
+  // 🚀 GENERATE PDF DOCUMENT WITH CLEAN PHP TEXT AND PERFECT SPACING
   const buildPdfDocument = async () => {
-    const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
-    const currentEventTitle = selectedEventId === 'ALL'
-      ? 'All Configured Assemblies'
-      : events.find((e) => e.id === selectedEventId)?.title || 'Selected Event';
-
-    const pageWidth = doc.internal.pageSize.getWidth();
-
-    // 1. Insert Left FCO Logo
-    const base64Fco = await getBase64ImageFromUrl(fcoLogo);
-    if (base64Fco) {
-      doc.addImage(base64Fco, 'PNG', 45, 34, 46, 46);
+    let query = supabase.from('profiles').select('*').eq('role', 'student');
+    if (debouncedSearch) {
+      query = query.or(`full_name.ilike.%${debouncedSearch}%,student_id.ilike.%${debouncedSearch}%`);
     }
+    if (programFilter !== 'ALL') query = query.eq('course', programFilter);
+    if (sectionFilter !== 'ALL') query = query.ilike('section', sectionFilter);
+    if (yearFilter !== 'ALL') query = query.eq('year_level', yearFilter);
 
-    // 2. Insert Right ESSU Logo
-    const base64Essu = await getBase64ImageFromUrl(essuLogo);
-    if (base64Essu) {
-      doc.addImage(base64Essu, 'PNG', pageWidth - 45 - 46, 34, 46, 46);
-    }
-
-    // 3. Centered Organization Header Texts
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(13);
-    doc.setTextColor(15, 23, 42);
-    doc.text('FEDERATED CLASS ORGANIZATION', pageWidth / 2, 48, { align: 'center' });
-
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(8.5);
-    doc.setTextColor(30, 58, 138);
-    doc.text('COLLEGE OF ENGINEERING', pageWidth / 2, 60, { align: 'center' });
-
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(11);
-    doc.setTextColor(139, 0, 0);
-    doc.text('OFFICIAL ATTENDANCE & COMPLIANCE SUMMARY REPORT', pageWidth / 2, 80, { align: 'center' });
-
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8.5);
-    doc.setTextColor(71, 85, 105);
-    doc.text(`Semester: ${semesterFilter} | Event: ${currentEventTitle} | Scope: ${reportType}`, pageWidth / 2, 93, { align: 'center' });
-
-    // 4. Summary Metric Banner Box
-    doc.setDrawColor(226, 232, 240);
-    doc.setFillColor(248, 250, 252);
-    doc.roundedRect(45, 108, pageWidth - 90, 26, 4, 4, 'FD');
-
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(8);
-    doc.setTextColor(15, 23, 42);
-    doc.text(`Total Students: ${filteredRows.length}`, 60, 124);
-    doc.setTextColor(5, 150, 105);
-    doc.text(`Present: ${filteredRows.filter((r) => r.isPresent).length}`, 185, 124);
-    doc.setTextColor(220, 38, 38);
-    doc.text(`Absent: ${filteredRows.filter((r) => !r.isPresent).length}`, 300, 124);
-    doc.setTextColor(139, 0, 0);
-    doc.text(`Fines Assessed: PHP ${filteredRows.reduce((sum, r) => sum + r.unpaidFineTotal, 0).toFixed(2)}`, 405, 124);
-
-    // 5. Format Data Table
-    const tableColumns = [
-      { header: 'Student ID', dataKey: 'studentId' },
-      { header: 'Full Name', dataKey: 'fullName' },
-      { header: 'Program', dataKey: 'course' },
-      { header: 'Yr & Sec', dataKey: 'yearSec' },
-      { header: 'Status', dataKey: 'status' },
-      { header: 'Check-In', dataKey: 'checkIn' },
-      { header: 'Fine (PHP)', dataKey: 'fines' },
-    ];
-
-    const tableRows = filteredRows.map((r) => ({
-      studentId: r.studentId,
-      fullName: r.fullName,
-      course: r.course,
-      yearSec: `${r.yearLevel}${r.section}`,
-      status: r.isPresent ? 'PRESENT' : 'ABSENT',
-      checkIn: r.checkInTime ? new Date(r.checkInTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—',
-      fines: r.unpaidFineTotal > 0 ? `PHP ${r.unpaidFineTotal.toFixed(2)}` : '0.00',
-    }));
-
-    autoTable(doc, {
-      startY: 144,
-      margin: { left: 45, right: 45 },
-      columns: tableColumns,
-      body: tableRows,
-      theme: 'grid',
-      styles: {
-        fontSize: 8,
-        cellPadding: 4.5,
-        textColor: [51, 65, 85],
-        lineColor: [226, 232, 240],
-        lineWidth: 0.5,
-      },
-      headStyles: {
-        fillColor: [139, 0, 0],
-        textColor: [255, 255, 255],
-        fontStyle: 'bold',
-      },
-      alternateRowStyles: {
-        fillColor: [248, 250, 252],
-      },
-      columnStyles: {
-        studentId: { cellWidth: 70, font: 'courier', fontStyle: 'bold' },
-        fullName: { cellWidth: 140, fontStyle: 'bold' },
-        course: { cellWidth: 50, halign: 'center' },
-        yearSec: { cellWidth: 55, halign: 'center' },
-        status: { cellWidth: 65, halign: 'center', fontStyle: 'bold' },
-        checkIn: { cellWidth: 65, halign: 'center' },
-        fines: { cellWidth: 77, halign: 'right', fontStyle: 'bold', textColor: [139, 0, 0] },
-      },
-      didParseCell: function (data) {
-        if (data.section === 'body' && data.column.dataKey === 'status') {
-          if (data.cell.raw === 'PRESENT') {
-            data.cell.styles.textColor = [5, 150, 105];
-          } else {
-            data.cell.styles.textColor = [220, 38, 38];
-          }
-        }
-      },
+    const { data: exportData } = await query.order('created_at', { ascending: false });
+    const records = exportData || [];
+    const allCompiled = compileRowsForStudents(records);
+    const exportFiltered = allCompiled.filter((r) => {
+      if (reportType === 'ATTENDANCE') return r.isPresent;
+      if (reportType === 'ABSENTEE') return !r.isPresent;
+      return true;
     });
 
-    return doc;
+    const doc = new jsPDF();
+    const img = new Image();
+    img.src = fcoLogo;
+
+    const generateTable = (docInstance) => {
+      // Header Section
+      docInstance.setFontSize(14);
+      docInstance.setTextColor(139, 0, 0);
+      docInstance.text('EASTERN SAMAR STATE UNIVERSITY', 36, 16);
+      
+      docInstance.setFontSize(10);
+      docInstance.setTextColor(100, 100, 100);
+      docInstance.text('FCO-COE STUDENT MASTERLIST & ATTENDANCE REPORT', 36, 23);
+
+      // Metadata lines
+      docInstance.setFontSize(9);
+      docInstance.setTextColor(70, 70, 70);
+      docInstance.text(`Program: ${programFilter} | Year: ${yearFilter} | Section: ${sectionFilter}`, 14, 36);
+      docInstance.text(`Generated On: ${new Date().toLocaleDateString()} | Total: ${exportFiltered.length}`, 14, 43);
+
+      // Using 'Fine (PHP)' instead of symbol to prevent font glitching
+      const tableColumn = ['No.', 'Student Number', 'Full Name', 'Program / Year & Sec', 'Status', 'Fine'];
+      const tableRows = exportFiltered.map((item, index) => [
+        index + 1,
+        item.studentId || 'N/A',
+        item.fullName || 'N/A',
+        `${item.course || 'COE'} ${item.yearLevel}${item.section}`,
+        item.isPresent ? 'PRESENT' : 'ABSENT',
+        item.unpaidFineTotal > 0 ? ` ${item.unpaidFineTotal.toFixed(2)}` : '0.00',
+      ]);
+
+      autoTable(docInstance, {
+        head: [tableColumn],
+        body: tableRows,
+        startY: 50,
+        theme: 'grid',
+        margin: { left: 14, right: 14 },
+        headStyles: { 
+          fillColor: [139, 0, 0], 
+          textColor: [255, 255, 255], 
+          fontStyle: 'bold', 
+          fontSize: 8.5,
+          halign: 'center'
+        },
+        styles: { fontSize: 8, fontStyle: 'normal', cellPadding: 3, valign: 'middle' },
+        columnStyles: {
+          0: { cellWidth: 12, halign: 'center' }, // No.
+          1: { cellWidth: 32, halign: 'left' },   // Student Number
+          2: { cellWidth: 58, halign: 'left' },   // Full Name
+          3: { cellWidth: 38, halign: 'center' }, // Program / Year & Sec
+          4: { cellWidth: 22, halign: 'center', fontStyle: 'bold' }, // Status
+          5: { cellWidth: 20, halign: 'right', textColor: [139, 0, 0] }, // Fine
+        },
+        didParseCell: function (data) {
+          if (data.section === 'body' && data.column.index === 4) {
+            if (data.cell.raw === 'PRESENT') {
+              data.cell.styles.textColor = [5, 150, 105];
+            } else {
+              data.cell.styles.textColor = [220, 38, 38];
+            }
+          }
+        },
+      });
+    };
+
+    return new Promise((resolve) => {
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const dataURL = canvas.toDataURL('image/png');
+        doc.addImage(dataURL, 'PNG', 14, 10, 18, 18);
+        generateTable(doc);
+        resolve(doc);
+      };
+      img.onerror = () => {
+        generateTable(doc);
+        resolve(doc);
+      };
+    });
   };
 
-  // Open Preview Modal
   const handleOpenPdfPreview = async () => {
     const doc = await buildPdfDocument();
     setPdfDocInstance(doc);
@@ -305,7 +289,6 @@ export default function ReportsTab({ currentUser }) {
     setPdfPreviewModalOpen(true);
   };
 
-  // Download PDF Directly with Audit Logging
   const handleDownloadPDF = async () => {
     try {
       const doc = pdfDocInstance || (await buildPdfDocument());
@@ -315,33 +298,15 @@ export default function ReportsTab({ currentUser }) {
         currentUser,
         actionType: 'EXPORT_AUDIT_REPORT',
         module: 'REPORTS',
-        details: {
-          export_format: 'PDF',
-          semester: semesterFilter,
-          report_type: reportType,
-          program_filter: programFilter,
-          year_filter: yearFilter,
-          event_scope: selectedEventId,
-          total_records: filteredRows.length,
-        },
+        details: { export_format: 'PDF', total_records: filteredRows.length },
       });
     } catch (err) {
       console.error('Error downloading PDF report:', err);
     }
   };
 
-  // CSV Export Handler with Audit Logging
   const handleExportCSV = async () => {
-    const headers = [
-      'Student ID',
-      'Full Name',
-      'Program',
-      'Year & Section',
-      'Attendance Status',
-      'Check-In Time',
-      'Outstanding Fines (PHP)',
-    ];
-
+    const headers = ['Student ID', 'Full Name', 'Program', 'Year & Section', 'Attendance Status', 'Check-In Time', 'Outstanding Fines (PHP)'];
     const csvRows = filteredRows.map((r) => [
       `"${r.studentId}"`,
       `"${r.fullName}"`,
@@ -352,9 +317,7 @@ export default function ReportsTab({ currentUser }) {
       r.unpaidFineTotal.toFixed(2),
     ]);
 
-    const csvContent =
-      'data:text/csv;charset=utf-8,' +
-      [headers.join(','), ...csvRows.map((e) => e.join(','))].join('\n');
+    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...csvRows.map((e) => e.join(','))].join('\n');
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
@@ -367,34 +330,7 @@ export default function ReportsTab({ currentUser }) {
       currentUser,
       actionType: 'EXPORT_AUDIT_REPORT',
       module: 'REPORTS',
-      details: {
-        export_format: 'CSV',
-        semester: semesterFilter,
-        report_type: reportType,
-        program_filter: programFilter,
-        year_filter: yearFilter,
-        event_scope: selectedEventId,
-        total_records: filteredRows.length,
-      },
-    });
-  };
-
-  const handlePrint = async () => {
-    window.print();
-
-    await logAdminAction({
-      currentUser,
-      actionType: 'EXPORT_AUDIT_REPORT',
-      module: 'REPORTS',
-      details: {
-        export_format: 'PRINT',
-        semester: semesterFilter,
-        report_type: reportType,
-        program_filter: programFilter,
-        year_filter: yearFilter,
-        event_scope: selectedEventId,
-        total_records: filteredRows.length,
-      },
+      details: { export_format: 'CSV', semester: semesterFilter, report_type: reportType, total_records: filteredRows.length },
     });
   };
 
@@ -406,25 +342,23 @@ export default function ReportsTab({ currentUser }) {
           <div className="flex items-center gap-3">
             <h2 className="text-xl font-black text-slate-800 tracking-tight">Official Reports & Attendance Audit</h2>
             <span className="px-3 py-1 bg-red-50 text-[#8b0000] border border-red-200 rounded-full text-[10px] font-black uppercase tracking-wider">
-              📅 {semesterFilter === 'ALL' ? 'All Semesters' : semesterFilter}
+              {semesterFilter === 'ALL' ? 'All Semesters' : semesterFilter}
             </span>
           </div>
           <p className="text-xs text-slate-500 font-medium mt-0.5">
-            Preview and download vectorized PDF files, export structured CSV sheets, or print directly.
+            Preview and download vectorized PDF files or export structured CSV sheets.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {/* Sync */}
           <button
-            onClick={fetchReportData}
+            onClick={fetchPaginatedReportData}
             title="Refresh database records"
             className="px-3.5 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 rounded-xl text-xs font-black uppercase tracking-wider transition cursor-pointer"
           >
             ↻
           </button>
 
-          {/* Export CSV */}
           <button
             onClick={handleExportCSV}
             className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-black uppercase tracking-wider transition flex items-center gap-1.5 cursor-pointer"
@@ -435,7 +369,6 @@ export default function ReportsTab({ currentUser }) {
             <span>Export CSV</span>
           </button>
 
-          {/* PDF Preview & Download Button */}
           <button
             onClick={handleOpenPdfPreview}
             className="px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-black uppercase tracking-wider transition shadow-sm flex items-center gap-1.5 cursor-pointer"
@@ -446,26 +379,15 @@ export default function ReportsTab({ currentUser }) {
             </svg>
             <span>Preview & Download PDF</span>
           </button>
-
-          {/* Direct Print Report */}
-          <button
-            onClick={handlePrint}
-            className="px-4 py-2.5 bg-[#8b0000] hover:bg-[#700000] text-white rounded-xl text-xs font-black uppercase tracking-wider transition shadow-sm shadow-[#8b0000]/20 flex items-center gap-1.5 cursor-pointer"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z" />
-            </svg>
-            <span>Print Report</span>
-          </button>
         </div>
       </div>
 
       {/* 2. STAT SUMMARY CARDS */}
       <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 print:hidden">
         <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Total Enrolled</p>
+          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Page Count</p>
           <p className="text-2xl font-black text-slate-900 mt-1">{totalReportStudents}</p>
-          <span className="text-[11px] font-semibold text-slate-500 mt-0.5 inline-block">Registered Students</span>
+          <span className="text-[11px] font-semibold text-slate-500 mt-0.5 inline-block">Loaded Students</span>
         </div>
 
         <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
@@ -511,7 +433,6 @@ export default function ReportsTab({ currentUser }) {
           </div>
 
           <div className="flex items-center gap-3">
-            {/* Semester Filter Dropdown */}
             <div className="flex items-center gap-2">
               <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Semester:</span>
               <select
@@ -526,7 +447,6 @@ export default function ReportsTab({ currentUser }) {
               </select>
             </div>
 
-            {/* Target Event Dropdown */}
             <div className="flex items-center gap-2">
               <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Event:</span>
               <select
@@ -554,12 +474,7 @@ export default function ReportsTab({ currentUser }) {
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#8b0000]/20"
             />
-            <svg
-              className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-            >
+            <svg className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
           </div>
@@ -587,31 +502,45 @@ export default function ReportsTab({ currentUser }) {
               <option value="3">3rd Year</option>
               <option value="4">4th Year</option>
             </select>
+
+            {/* Section Dropdown */}
+            <select
+              value={sectionFilter}
+              onChange={(e) => setSectionFilter(e.target.value)}
+              className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-800 focus:outline-none cursor-pointer"
+            >
+              <option value="ALL">All Sections</option>
+              <option value="A">Section A</option>
+              <option value="B">Section B</option>
+              <option value="C">Section C</option>
+              <option value="D">Section D</option>
+            </select>
           </div>
         </div>
       </div>
 
-      {/* 4. OFFICIAL REPORT SHEET TABLE */}
-      <div className="bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden p-6">
-        {/* Printable/Browser Header Matching Design */}
-        <div className="hidden print:block text-center pb-6 border-b border-slate-200 mb-6">
-          <div className="flex items-center justify-between px-6 mb-2">
-            <img src={fcoLogo} alt="FCO Logo" className="w-14 h-14 object-contain" />
-            <div className="text-center flex-1 mx-4">
-              <h1 className="text-base font-black text-slate-900 tracking-wider">
-                FEDERATED CLASS ORGANIZATION
-              </h1>
-              <p className="text-[11px] font-bold text-blue-900 uppercase">
-                COLLEGE OF ENGINEERING
-              </p>
-              <h2 className="text-sm font-black text-[#8b0000] uppercase tracking-wide mt-2">
-                OFFICIAL ATTENDANCE & COMPLIANCE SUMMARY REPORT
-              </h2>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Semester: {semesterFilter} | Event: {selectedEventId === 'ALL' ? 'All Configured Assemblies' : events.find((e) => e.id === selectedEventId)?.title} | Scope: {reportType}
-              </p>
-            </div>
-            <img src={essuLogo} alt="ESSU Logo" className="w-14 h-14 object-contain" />
+      {/* 4. OFFICIAL REPORT SHEET TABLE WITH PAGINATION */}
+      <div className="bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden p-6 space-y-4">
+        {/* Pagination Controls Bar */}
+        <div className="flex justify-between items-center pb-3 border-b border-slate-100 print:hidden">
+          <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+            Showing Page {page + 1}
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0}
+              className="px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-700 disabled:opacity-40 cursor-pointer shadow-sm"
+            >
+              Previous
+            </button>
+            <button
+              onClick={() => setPage((p) => p + 1)}
+              disabled={paginatedStudents.length < pageSize}
+              className="px-3 py-1.5 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-700 disabled:opacity-40 cursor-pointer shadow-sm"
+            >
+              Next
+            </button>
           </div>
         </div>
 
@@ -621,7 +550,7 @@ export default function ReportsTab({ currentUser }) {
           </div>
         ) : filteredRows.length === 0 ? (
           <div className="p-12 text-center text-xs font-bold text-slate-400 uppercase tracking-wider">
-            No student records matching this report configuration.
+            No student records matching this report configuration on this page.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -637,12 +566,12 @@ export default function ReportsTab({ currentUser }) {
                   <th className="px-5 py-3.5 text-right">Outstanding Fines</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100 font-medium text-xs">
+              <tbody className="divide-y divide-slate-100 font-normal text-xs">
                 {filteredRows.map((row) => (
                   <tr key={row.id} className="hover:bg-slate-50/50 transition">
-                    <td className="px-5 py-3.5 font-mono font-bold text-slate-900">{row.studentId}</td>
-                    <td className="px-5 py-3.5 font-bold text-slate-900">{row.fullName}</td>
-                    <td className="px-5 py-3.5 font-bold text-slate-800">{row.course}</td>
+                    <td className="px-5 py-3.5 font-mono text-slate-900">{row.studentId}</td>
+                    <td className="px-5 py-3.5 text-slate-900">{row.fullName}</td>
+                    <td className="px-5 py-3.5 text-slate-800">{row.course}</td>
                     <td className="px-5 py-3.5 font-mono text-slate-700">
                       {row.yearLevel}{row.section}
                     </td>
@@ -662,7 +591,7 @@ export default function ReportsTab({ currentUser }) {
                     </td>
                     <td className="px-5 py-3.5 text-right">
                       {row.unpaidFineTotal > 0 ? (
-                        <span className="font-bold text-red-600 font-mono">
+                        <span className="text-red-600 font-mono">
                           ₱{row.unpaidFineTotal.toFixed(2)}
                         </span>
                       ) : (
@@ -681,7 +610,6 @@ export default function ReportsTab({ currentUser }) {
       {pdfPreviewModalOpen && (
         <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl max-w-4xl w-full h-[88vh] flex flex-col shadow-2xl border border-slate-200 overflow-hidden">
-            {/* Modal Header */}
             <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/70 flex-shrink-0">
               <div className="flex items-center gap-3">
                 <img src={fcoLogo} alt="FCO Logo" className="w-8 h-8 object-contain" />
@@ -690,7 +618,7 @@ export default function ReportsTab({ currentUser }) {
                     PDF Document Preview
                   </h3>
                   <p className="text-[10px] text-slate-400 font-semibold">
-                    Inspect formatted dual-logo table report before saving
+                    Inspect formatted table report before saving
                   </p>
                 </div>
               </div>
@@ -714,7 +642,6 @@ export default function ReportsTab({ currentUser }) {
               </div>
             </div>
 
-            {/* Modal Body / Embedded PDF Viewer */}
             <div className="flex-1 bg-slate-200 p-2 overflow-hidden">
               {pdfPreviewUrl ? (
                 <iframe

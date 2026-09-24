@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Calendar, Users, Receipt, TrendingUp, CheckCircle2 } from 'lucide-react';
-import { supabase } from '../services/supabase'; // Adjust path if your supabase client is located elsewhere
+import { supabase } from '../services/supabase'; // Main FCO database for profiles only
+import { attendanceClient } from '../lib/attendanceClient'; // Secondary database for IIEE tables
 
 export default function OverviewTab() {
   const [loading, setLoading] = useState(true);
@@ -13,30 +14,29 @@ export default function OverviewTab() {
     fetchOverviewData();
   }, []);
 
-  // 🚀 LIGHTNING-FAST: Optimized with Promise.all and head-only count queries
   const fetchOverviewData = async () => {
     try {
       setLoading(true);
 
       const [studentsRes, eventsRes, attendanceRes, finesRes] = await Promise.all([
-        // 1. Get exact count header without downloading full student row payloads
+        // 1. Profiles live in Main FCO Database
         supabase
           .from('profiles')
           .select('*', { count: 'exact', head: true })
           .or('course.ilike.%BSEE%,course.ilike.%ELECTRICAL%'),
 
-        // 2. Fetch IIEE events
-        supabase
+        // 2. IIEE Events live in Secondary Database
+        attendanceClient
           .from('iiee_events')
           .select('id'),
 
-        // 3. Get exact count header for attendance records without loading rows
-        supabase
+        // 3. IIEE Attendance lives in Secondary Database
+        attendanceClient
           .from('iiee_attendance')
           .select('*', { count: 'exact', head: true }),
 
-        // 4. Fetch fines ledger for calculations
-        supabase
+        // 4. IIEE Fines live in Secondary Database
+        attendanceClient
           .from('iiee_fines')
           .select('amount, status')
       ]);
@@ -45,7 +45,6 @@ export default function OverviewTab() {
       setEventCount(eventsRes.data?.length || 0);
       setAttendanceCount(attendanceRes.count || 0);
 
-      // Compute total unpaid fines in memory instantly
       if (finesRes.data) {
         const sum = finesRes.data.reduce((acc, f) => {
           if (['unpaid', 'pending_approval'].includes(String(f.status || '').toLowerCase())) {
@@ -80,13 +79,11 @@ export default function OverviewTab() {
         <MetricCard title="Total IIEE Students" value={loading ? '...' : studentCount} icon={<Users size={20} color="#854d0e" />} trend="BSEE / Electrical Enrolled" />
         <MetricCard title="Active IIEE Events" value={loading ? '...' : eventCount} icon={<Calendar size={20} color="#0284c7" />} trend="Isolated to IIEE" />
         <MetricCard title="Attendance Logs" value={loading ? '...' : attendanceCount} icon={<CheckCircle2 size={20} color="#16a34a" />} trend="Scanned via QR" />
-        <MetricCard title="Total Fines Recorded" value={loading ? '...' : `${totalFinesValue.toFixed(2)}`} icon={<Receipt size={20} color="#dc2626" />} trend="Outstanding ledger" />
+        <MetricCard title="Total Fines Recorded" value={loading ? '...' : `₱${totalFinesValue.toFixed(2)}`} icon={<Receipt size={20} color="#dc2626" />} trend="Outstanding ledger" />
       </div>
 
       {/* Analytics Breakdown Grid */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '24px', marginBottom: '32px' }}>
-        
-        {/* System Information Card */}
         <div style={{ backgroundColor: '#ffffff', padding: '24px', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
           <h2 style={{ fontSize: '14px', fontWeight: '900', textTransform: 'uppercase', marginBottom: '16px', color: '#0f172a' }}>
             System Information
@@ -100,7 +97,6 @@ export default function OverviewTab() {
             </p>
           </div>
         </div>
-
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { supabase } from '../../lib/supabaseClient';
@@ -12,11 +12,24 @@ export default function StudentsTab({ currentUser }) {
   const [isEditing, setIsEditing] = useState(false);
   const [selectedStudentId, setSelectedStudentId] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
+
+  // File Upload Reference for Bulk Import
+  const fileInputRef = useRef(null);
+
+  // Server-Side Filters & Pagination States
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [programFilter, setProgramFilter] = useState('ALL');
   const [sectionFilter, setSectionFilter] = useState('ALL');
-  const [yearFilter, setYearFilter] = useState('ALL'); // <--- Added Year Filter State
-  const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
+  const [yearFilter, setYearFilter] = useState('ALL');
+  
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalCount, setTotalCount] = useState(0);
+  const pageSize = 15;
+
+  // Global Counts for Top Cards
+  const [programCounts, setProgramCounts] = useState({ ce: 0, ee: 0, cpe: 0 });
 
   // Form states
   const [studentId, setStudentId] = useState('');
@@ -26,16 +39,31 @@ export default function StudentsTab({ currentUser }) {
   const [yearLevel, setYearLevel] = useState('1');
   const [section, setSection] = useState('A');
 
+  // 1. Debounce Search Input
   useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchQuery);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  // 2. Reset Page to 1 when filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [debouncedSearch, programFilter, sectionFilter, yearFilter]);
+
+  // 3. Fetch Data & Set Realtime Subscription
+  useEffect(() => {
+    fetchGlobalCounts();
     fetchStudents();
 
-    // Realtime sync for student profile edits and password resets
     const channel = supabase
       .channel('realtime_students_admin')
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'profiles' },
         () => {
+          fetchGlobalCounts();
           fetchStudents();
         }
       )
@@ -44,7 +72,7 @@ export default function StudentsTab({ currentUser }) {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, []);
+  }, [currentPage, debouncedSearch, programFilter, sectionFilter, yearFilter]);
 
   const showToast = (message, type = 'success') => {
     setToast({ show: true, message, type });
@@ -53,28 +81,66 @@ export default function StudentsTab({ currentUser }) {
     }, 3500);
   };
 
+  // 4. Lightweight Aggregate Counts
+  const fetchGlobalCounts = async () => {
+    try {
+      const getCount = async (courseName) => {
+        const { count, error } = await supabase
+          .from('profiles')
+          .select('*', { count: 'exact', head: true })
+          .eq('role', 'student')
+          .eq('course', courseName);
+        if (error) throw error;
+        return count || 0;
+      };
+
+      const [ce, ee, cpe] = await Promise.all([
+        getCount('BSCE'),
+        getCount('BSEE'),
+        getCount('BSCpE')
+      ]);
+
+      setProgramCounts({ ce, ee, cpe });
+    } catch (err) {
+      console.error('Error fetching counts:', err);
+    }
+  };
+
+  // 5. Paginated & Server-Filtered Fetch
   const fetchStudents = async () => {
     try {
       setLoading(true);
-      const { data, error } = await supabase
+      let query = supabase
         .from('profiles')
-        .select('*')
-        .eq('role', 'student')
-        .order('created_at', { ascending: false });
+        .select('*', { count: 'exact' })
+        .eq('role', 'student');
+
+      if (debouncedSearch) {
+        query = query.or(`full_name.ilike.%${debouncedSearch}%,student_id.ilike.%${debouncedSearch}%`);
+      }
+      if (programFilter !== 'ALL') query = query.eq('course', programFilter);
+      if (sectionFilter !== 'ALL') query = query.ilike('section', sectionFilter);
+      if (yearFilter !== 'ALL') query = query.eq('year_level', yearFilter);
+
+      const from = (currentPage - 1) * pageSize;
+      const to = from + pageSize - 1;
+
+      query = query.order('created_at', { ascending: false }).range(from, to);
+
+      const { data, count, error } = await query;
 
       if (error) throw error;
       setStudents(data || []);
+      if (count !== null) setTotalCount(count);
     } catch (err) {
       console.error('Error fetching students:', err);
+      showToast('Failed to load students.', 'error');
     } finally {
       setLoading(false);
     }
   };
 
-  // Program counts
-  const ceCount = students.filter((s) => s.course === 'BSCE').length;
-  const eeCount = students.filter((s) => s.course === 'BSEE').length;
-  const cpeCount = students.filter((s) => s.course === 'BSCpE').length;
+  const totalPages = Math.ceil(totalCount / pageSize) || 1;
 
   const handleOpenCreateModal = () => {
     setIsEditing(false);
@@ -93,11 +159,98 @@ export default function StudentsTab({ currentUser }) {
     setSelectedStudentId(student.id);
     setStudentId(student.student_id || '');
     setFullName(student.full_name || '');
-    setEmail(student.email || '');
+    setEmail(student.email || ''); // <--- Properly binds the student's current email into the state
     setCourse(student.course || 'BSCE');
     setYearLevel(student.year_level?.toString() || '1');
     setSection(student.section || 'A');
     setModalOpen(true);
+  };
+
+  // 6. Bulk Registration Feature
+  const triggerBulkUpload = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.click();
+    }
+  };
+
+  const handleBulkUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const text = e.target.result;
+      const rows = text.split('\n').map(row => row.split(','));
+      
+      if (rows.length < 2) {
+        showToast('CSV file is empty or missing data rows.', 'error');
+        return;
+      }
+
+      const headers = rows[0].map(h => h.trim().toLowerCase());
+      
+      const sidIdx = headers.indexOf('student_id');
+      const nameIdx = headers.indexOf('full_name');
+      const courseIdx = headers.indexOf('course');
+      const yearIdx = headers.indexOf('year_level');
+      const secIdx = headers.indexOf('section');
+      const emailIdx = headers.indexOf('email');
+
+      if (sidIdx === -1 || nameIdx === -1 || courseIdx === -1 || yearIdx === -1 || secIdx === -1) {
+        showToast('CSV missing required headers. Need: student_id, full_name, course, year_level, section', 'error');
+        event.target.value = null;
+        return;
+      }
+
+      const validRows = rows.slice(1).filter(r => r.length > 1 && r[sidIdx]?.trim() !== '');
+
+      if (!window.confirm(`Found ${validRows.length} students in ${file.name}. Start bulk registration?`)) {
+        event.target.value = null;
+        return;
+      }
+
+      setSubmitting(true);
+      showToast('Starting bulk import... Do not close the window.', 'success');
+
+      let successCount = 0;
+      let failCount = 0;
+
+      for (let i = 0; i < validRows.length; i++) {
+        const row = validRows[i];
+        try {
+          const { error } = await supabase.rpc('admin_register_student', {
+            p_student_id: row[sidIdx].trim(),
+            p_full_name: row[nameIdx].trim(),
+            p_course: row[courseIdx].trim().toUpperCase(),
+            p_year_level: parseInt(row[yearIdx].trim(), 10) || 1,
+            p_section: row[secIdx].trim().toUpperCase(),
+            p_email: emailIdx !== -1 && row[emailIdx] ? row[emailIdx].trim() : null,
+          });
+
+          if (error) throw error;
+          successCount++;
+        } catch (err) {
+          console.error(`Failed to register ${row[sidIdx]}:`, err);
+          failCount++;
+        }
+      }
+
+      await logAdminAction({
+        currentUser,
+        actionType: 'BULK_REGISTER_STUDENTS',
+        module: 'STUDENTS',
+        targetId: 'BULK_CSV',
+        details: { file_name: file.name, success_count: successCount, fail_count: failCount },
+      });
+
+      setSubmitting(false);
+      event.target.value = null;
+      showToast(`Import Complete. ${successCount} Success, ${failCount} Failed.`, failCount > 0 ? 'error' : 'success');
+      
+      fetchGlobalCounts();
+      fetchStudents();
+    };
+    reader.readAsText(file);
   };
 
   const handleSubmit = async (e) => {
@@ -133,6 +286,7 @@ export default function StudentsTab({ currentUser }) {
             course,
             year_level: parseInt(yearLevel, 10),
             section: section.trim().toUpperCase(),
+            email: email.trim() || null,
           },
         });
 
@@ -167,6 +321,7 @@ export default function StudentsTab({ currentUser }) {
       }
 
       setModalOpen(false);
+      fetchGlobalCounts();
       fetchStudents();
     } catch (err) {
       showToast(err.message || 'Action failed.', 'error');
@@ -230,76 +385,56 @@ export default function StudentsTab({ currentUser }) {
       });
 
       showToast(`Student account deleted.`);
+      fetchGlobalCounts();
       fetchStudents();
     } catch (err) {
       showToast(err.message || 'Failed to delete student.', 'error');
     }
   };
 
-  // Filter logic including Year Level
-  const filteredStudents = students.filter((s) => {
-    const sId = s.student_id || '';
-    const sName = s.full_name || '';
-    const sCourse = s.course || '';
-    const sSection = s.section || '';
-    const sYear = s.year_level?.toString() || '';
+  const handleDownloadPDF = async () => {
+    showToast('Preparing PDF data...', 'success');
+    
+    let query = supabase.from('profiles').select('*').eq('role', 'student');
+    if (debouncedSearch) {
+      query = query.or(`full_name.ilike.%${debouncedSearch}%,student_id.ilike.%${debouncedSearch}%`);
+    }
+    if (programFilter !== 'ALL') query = query.eq('course', programFilter);
+    if (sectionFilter !== 'ALL') query = query.ilike('section', sectionFilter);
+    if (yearFilter !== 'ALL') query = query.eq('year_level', yearFilter);
 
-    const matchesSearch =
-      sName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      sId.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesProgram = programFilter === 'ALL' || sCourse === programFilter;
-    const matchesSection = sectionFilter === 'ALL' || sSection.toUpperCase() === sectionFilter;
-    const matchesYear = yearFilter === 'ALL' || sYear === yearFilter;
+    const { data: exportData, error } = await query.order('created_at', { ascending: false });
 
-    return matchesSearch && matchesProgram && matchesSection && matchesYear;
-  });
-
-  // PDF Export & Preview Generator
-  const handleDownloadPDF = () => {
-    if (filteredStudents.length === 0) {
+    if (error || !exportData || exportData.length === 0) {
       showToast('No student records available to export for the current filters.', 'error');
       return;
     }
 
     const doc = new jsPDF();
-
     const img = new Image();
     img.src = fcoLogo;
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0);
-      const dataURL = canvas.toDataURL('image/png');
-
-      doc.addImage(dataURL, 'PNG', 14, 10, 18, 18);
-
-      doc.setFontSize(14);
-      doc.setTextColor(139, 0, 0);
-      doc.text('EASTERN SAMAR STATE UNIVERSITY', 36, 15);
+    
+    const generateTable = (docInstance) => {
+      docInstance.setFontSize(14);
+      docInstance.setTextColor(139, 0, 0);
+      docInstance.text('EASTERN SAMAR STATE UNIVERSITY', 36, 15);
       
-      doc.setFontSize(10);
-      doc.setTextColor(100, 100, 100);
-      doc.text('College of Engineering - Student Masterlist Roster', 36, 21);
-      doc.text(`Program: ${programFilter} | Year: ${yearFilter} | Section: ${sectionFilter}`, 14, 32);
-      doc.text(`Generated On: ${new Date().toLocaleDateString()}`, 14, 38);
+      docInstance.setFontSize(10);
+      docInstance.setTextColor(100, 100, 100);
+      docInstance.text('FCO-COE STUDENT MASTERLIST', 36, 21);
+      docInstance.text(`Program: ${programFilter} | Year: ${yearFilter} | Section: ${sectionFilter}`, 14, 32);
+      docInstance.text(`Generated On: ${new Date().toLocaleDateString()} | Total: ${exportData.length}`, 14, 38);
 
       const tableColumn = ['No.', 'Student Number', 'Full Name', 'Program', 'Year & Section'];
-      const tableRows = [];
+      const tableRows = exportData.map((item, index) => [
+        index + 1,
+        item.student_id || 'N/A',
+        item.full_name || 'N/A',
+        item.course || 'N/A',
+        `${item.year_level || ''}${item.section || ''}`,
+      ]);
 
-      filteredStudents.forEach((item, index) => {
-        const studentData = [
-          index + 1,
-          item.student_id || 'N/A',
-          item.full_name || 'N/A',
-          item.course || 'N/A',
-          `${item.year_level || ''}${item.section || ''}`,
-        ];
-        tableRows.push(studentData);
-      });
-
-      autoTable(doc, {
+      autoTable(docInstance, {
         head: [tableColumn],
         body: tableRows,
         startY: 44,
@@ -308,45 +443,23 @@ export default function StudentsTab({ currentUser }) {
         styles: { fontSize: 9 },
       });
 
-      doc.output('dataurlnewwindow');
-      showToast('PDF Roster with logo generated successfully!');
+      docInstance.output('dataurlnewwindow');
+      showToast('PDF Roster generated successfully!');
+    };
+
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const dataURL = canvas.toDataURL('image/png');
+      doc.addImage(dataURL, 'PNG', 14, 10, 18, 18);
+      generateTable(doc);
     };
 
     img.onerror = () => {
-      doc.setFontSize(14);
-      doc.setTextColor(139, 0, 0);
-      doc.text('EASTERN SAMAR STATE UNIVERSITY', 36, 15);
-      
-      doc.setFontSize(10);
-      doc.setTextColor(100, 100, 100);
-      doc.text('College of Engineering - Student Masterlist', 36, 21);
-      
-      doc.text(`Program: ${programFilter} | Year: ${yearFilter} | Section: ${sectionFilter}`, 14, 32);
-
-      const tableColumn = ['No.', 'Student Number', 'Full Name', 'Program', 'Year & Section'];
-      const tableRows = [];
-
-      filteredStudents.forEach((item, index) => {
-        tableRows.push([
-          index + 1,
-          item.student_id || 'N/A',
-          item.full_name || 'N/A',
-          item.course || 'N/A',
-          `${item.year_level || ''}${item.section || ''}`,
-        ]);
-      });
-
-      autoTable(doc, {
-        head: [tableColumn],
-        body: tableRows,
-        startY: 40,
-        theme: 'grid',
-        headStyles: { fillColor: [139, 0, 0] },
-        styles: { fontSize: 9 },
-      });
-
-      doc.output('dataurlnewwindow');
-      showToast('PDF Roster generated successfully!');
+      generateTable(doc);
     };
   };
 
@@ -354,7 +467,7 @@ export default function StudentsTab({ currentUser }) {
     <div className="space-y-6 max-w-7xl mx-auto relative">
       {/* Toast Notification */}
       {toast.show && (
-        <div className="fixed top-6 right-6 z-[100] animate-bounce">
+        <div className="fixed top-6 right-6 z-[9999] animate-bounce">
           <div
             className={`px-4 py-3 rounded-xl shadow-xl flex items-center gap-3 border text-xs font-bold ${
               toast.type === 'error'
@@ -372,19 +485,19 @@ export default function StudentsTab({ currentUser }) {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
         <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm">
           <h3 className="text-base font-black text-slate-800">Civil Engineering</h3>
-          <p className="text-3xl font-black text-slate-900 mt-2">{ceCount}</p>
+          <p className="text-3xl font-black text-slate-900 mt-2">{programCounts.ce}</p>
           <p className="text-xs text-slate-400 font-semibold mt-0.5">Enrolled Students</p>
         </div>
 
         <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm">
           <h3 className="text-base font-black text-slate-800">Electrical Engineering</h3>
-          <p className="text-3xl font-black text-slate-900 mt-2">{eeCount}</p>
+          <p className="text-3xl font-black text-slate-900 mt-2">{programCounts.ee}</p>
           <p className="text-xs text-slate-400 font-semibold mt-0.5">Enrolled Students</p>
         </div>
 
         <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-sm">
           <h3 className="text-base font-black text-slate-800">Computer Engineering</h3>
-          <p className="text-3xl font-black text-slate-900 mt-2">{cpeCount}</p>
+          <p className="text-3xl font-black text-slate-900 mt-2">{programCounts.cpe}</p>
           <p className="text-xs text-slate-400 font-semibold mt-0.5">Enrolled Students</p>
         </div>
       </div>
@@ -397,6 +510,15 @@ export default function StudentsTab({ currentUser }) {
             Initial password defaults to the student number until changed by the student on mobile.
           </p>
         </div>
+        
+        <input 
+          type="file" 
+          accept=".csv" 
+          className="hidden" 
+          ref={fileInputRef} 
+          onChange={handleBulkUpload} 
+        />
+
         <div className="flex items-center gap-3">
           <button
             onClick={handleDownloadPDF}
@@ -406,6 +528,17 @@ export default function StudentsTab({ currentUser }) {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
             <span>Download PDF Roster</span>
+          </button>
+
+          <button
+            onClick={triggerBulkUpload}
+            disabled={submitting}
+            className="px-4 py-3 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.99] disabled:opacity-50 text-white font-bold text-xs uppercase tracking-widest rounded-xl transition shadow-md shadow-emerald-600/20 flex items-center gap-2 cursor-pointer"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+            </svg>
+            <span>{submitting ? 'Uploading...' : 'Bulk Import (CSV)'}</span>
           </button>
 
           <button
@@ -457,7 +590,6 @@ export default function StudentsTab({ currentUser }) {
             ))}
           </div>
 
-          {/* Year Level Filter Dropdown */}
           <select
             value={yearFilter}
             onChange={(e) => setYearFilter(e.target.value)}
@@ -470,7 +602,6 @@ export default function StudentsTab({ currentUser }) {
             <option value="4">4th Year</option>
           </select>
 
-          {/* Section Filter Dropdown */}
           <select
             value={sectionFilter}
             onChange={(e) => setSectionFilter(e.target.value)}
@@ -486,13 +617,13 @@ export default function StudentsTab({ currentUser }) {
       </div>
 
       {/* 4. STUDENTS MASTERLIST TABLE */}
-      <div className="bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden">
+      <div className="bg-white rounded-2xl border border-slate-200/80 shadow-sm flex flex-col overflow-hidden">
         {loading ? (
           <div className="p-12 text-center text-xs font-bold text-slate-400 uppercase tracking-wider">
             Fetching student accounts...
           </div>
         ) : (
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto flex-1">
             <table className="w-full text-left text-sm text-slate-600">
               <thead className="bg-slate-50 border-b border-slate-200/80 text-[11px] font-bold text-slate-500 uppercase tracking-wider">
                 <tr>
@@ -504,14 +635,14 @@ export default function StudentsTab({ currentUser }) {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 font-medium text-xs">
-                {filteredStudents.length === 0 ? (
+                {students.length === 0 ? (
                   <tr>
                     <td colSpan="5" className="px-6 py-12 text-center text-slate-400 font-bold uppercase tracking-wider">
                       No students found matching the selected filters.
                     </td>
                   </tr>
                 ) : (
-                  filteredStudents.map((item) => (
+                  students.map((item) => (
                     <tr key={item.id} className="hover:bg-slate-50/50 transition">
                       <td className="px-6 py-4">
                         <div className="flex items-center gap-3">
@@ -583,11 +714,34 @@ export default function StudentsTab({ currentUser }) {
             </table>
           </div>
         )}
+
+        {/* 7. PAGINATION CONTROLS */}
+        <div className="flex items-center justify-between px-6 py-4 border-t border-slate-200/80 bg-slate-50">
+          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+            Showing <span className="text-slate-900">{students.length > 0 ? (currentPage - 1) * pageSize + 1 : 0}</span> to <span className="text-slate-900">{Math.min(currentPage * pageSize, totalCount)}</span> of <span className="text-slate-900">{totalCount}</span>
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+              disabled={currentPage === 1 || loading}
+              className="px-4 py-2 border border-slate-200 rounded-lg text-xs font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed transition cursor-pointer"
+            >
+              Previous
+            </button>
+            <button
+              onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+              disabled={currentPage === totalPages || totalPages === 0 || loading}
+              className="px-4 py-2 border border-slate-200 rounded-lg text-xs font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed transition cursor-pointer"
+            >
+              Next
+            </button>
+          </div>
+        </div>
       </div>
 
-      {/* 5. CREATE / EDIT MODAL */}
+      {/* CREATE / EDIT MODAL */}
       {modalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-[110] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-100">
             <div className="flex justify-between items-center pb-4 border-b border-slate-100">
               <div>

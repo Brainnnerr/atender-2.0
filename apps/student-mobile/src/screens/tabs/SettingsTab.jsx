@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   StyleSheet,
   View,
@@ -10,13 +10,16 @@ import {
   ActivityIndicator,
   Alert,
   Platform,
+  Dimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import QRCode from 'react-native-qrcode-svg';
 import { supabase } from '../../services/supabase';
+import SubOrgQRScannerModal from '../SubOrgQRScannerModal';
 
-// Added 'onOpenChapterScanner' to props
-export default function SettingsTab({ profile, onSignOut, onOpenChapterScanner }) {
+const { width } = Dimensions.get('window');
+
+export default function SettingsTab({ profile, onSignOut }) {
   // Password Modal State
   const [passwordModalVisible, setPasswordModalVisible] = useState(false);
   const [currentPassword, setCurrentPassword] = useState('');
@@ -24,73 +27,36 @@ export default function SettingsTab({ profile, onSignOut, onOpenChapterScanner }
   const [confirmPassword, setConfirmPassword] = useState('');
   const [changingPassword, setChangingPassword] = useState(false);
 
+  // Sign Out Confirmation Modal State
+  const [signOutModalVisible, setSignOutModalVisible] = useState(false);
+
+  // Sub-Org QR Scanner Modal State
+  const [subOrgScannerVisible, setSubOrgScannerVisible] = useState(false);
+
+  // Profile QR Code Modal State (For Offline Scanning by Admins)
+  const [profileQrModalVisible, setProfileQrModalVisible] = useState(false);
+
   // Show / Hide Password Visibility Toggles
   const [showCurrentPassword, setShowCurrentPassword] = useState(false);
   const [showNewPassword, setShowNewPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
-  // Offline Sync State
-  const [offlineQueue, setOfflineQueue] = useState([]);
-  const [syncing, setSyncing] = useState(false);
+  const course = (profile?.course || '').toUpperCase();
+  const chapterCode = course.includes('BSEE') || course.includes('ELECTRICAL') 
+    ? 'IIEE' 
+    : course.includes('BSCE') || course.includes('CIVIL') 
+    ? 'PICE' 
+    : 'Sub-Org';
 
-  useEffect(() => {
-    loadOfflineQueue();
-  }, []);
-
-  const loadOfflineQueue = async () => {
-    try {
-      const dataStr = await AsyncStorage.getItem('@offline_scans');
-      const queue = dataStr ? JSON.parse(dataStr) : [];
-      setOfflineQueue(queue);
-    } catch {
-      setOfflineQueue([]);
-    }
-  };
-
-  const handleSyncOfflineData = async () => {
-    if (offlineQueue.length === 0) {
-      Alert.alert('All Synced', 'There are no pending offline attendance scans.');
-      return;
-    }
-
-    setSyncing(true);
-    let successCount = 0;
-    const remainingQueue = [];
-
-    for (const item of offlineQueue) {
-      try {
-        const { data: res, error: rpcErr } = await supabase.rpc('record_student_attendance', {
-          p_event_id: item.eventId,
-          p_student_id: item.studentId,
-          p_proof_photo_url: item.photoBase64,
-        });
-
-        if (rpcErr || !res?.success) {
-          remainingQueue.push(item);
-        } else {
-          successCount++;
-        }
-      } catch {
-        remainingQueue.push(item);
-      }
-    }
-
-    await AsyncStorage.setItem('@offline_scans', JSON.stringify(remainingQueue));
-    setOfflineQueue(remainingQueue);
-    setSyncing(false);
-
-    if (successCount > 0) {
-      Alert.alert(
-        'Sync Complete',
-        `Successfully synced ${successCount} attendance log(s) to the server!`
-      );
-    } else {
-      Alert.alert(
-        'Sync Incomplete',
-        'Could not upload records. Check your internet connection.'
-      );
-    }
-  };
+  // Universal student payload for offline scanning
+  const studentQrPayload = JSON.stringify({
+    type: 'ATENDER_STUDENT_PROFILE',
+    studentId: profile?.student_id || 'N/A',
+    name: profile?.full_name || 'N/A',
+    course: profile?.course || 'N/A',
+    yearLevel: profile?.year_level || '',
+    section: profile?.section || '',
+  });
 
   const handleChangePasswordSubmit = async () => {
     if (!currentPassword.trim() || !newPassword.trim()) {
@@ -110,7 +76,6 @@ export default function SettingsTab({ profile, onSignOut, onOpenChapterScanner }
 
     setChangingPassword(true);
     try {
-      // Safe resolution of user ID (from profile prop or active auth session)
       let userId = profile?.id;
       if (!userId) {
         const { data: authData } = await supabase.auth.getUser();
@@ -124,12 +89,11 @@ export default function SettingsTab({ profile, onSignOut, onOpenChapterScanner }
 
       const { data: res, error } = await supabase.rpc('student_change_password', {
         p_user_id: userId,
-        p_current_password: currentPassword.trim(),
         p_new_password: newPassword.trim(),
       });
 
       if (error || !res?.success) {
-        Alert.alert('Failed', res?.message || error?.message || 'Current password incorrect.');
+        Alert.alert('Failed', res?.message || error?.message || 'Could not update password.');
         return;
       }
 
@@ -148,19 +112,6 @@ export default function SettingsTab({ profile, onSignOut, onOpenChapterScanner }
     }
   };
 
-  // Determine sub-org display name and theme color based on student course
-  const course = (profile?.course || '').toUpperCase();
-  let subOrgName = '';
-  let themeColor = '#8b0000'; // Default Maroon
-  
-  if (course.includes('BSCE') || course.includes('CIVIL')) {
-    subOrgName = 'PICE Chapter';
-    themeColor = '#b45309'; // Bronze/Amber for PICE
-  } else if (course.includes('BSEE') || course.includes('ELECTRICAL')) {
-    subOrgName = 'IIEE Chapter';
-    themeColor = '#854d0e'; // Dark Amber for IIEE
-  }
-
   return (
     <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
       <View style={styles.topHeader}>
@@ -168,66 +119,47 @@ export default function SettingsTab({ profile, onSignOut, onOpenChapterScanner }
         <Text style={styles.greetingName}>Account Settings</Text>
       </View>
 
-      {/* DEPARTMENT CHAPTER SCANNER BOX (Rendered ONLY if the student belongs to a chapter like PICE or IIEE) */}
-      {subOrgName ? (
-        <View style={styles.card}>
-          <Text style={styles.cardHeader}>{subOrgName} Scanner</Text>
-          <Text style={styles.syncSubStyle}>
-            Scan official event QR codes issued by your department chapter. Main FCO codes or other department codes are strictly restricted here.
-          </Text>
-
-          <TouchableOpacity
-            onPress={onOpenChapterScanner}
-            style={[styles.syncButton, { backgroundColor: themeColor, marginTop: 12 }]}
-            activeOpacity={0.85}
-          >
-            <View style={styles.btnContent}>
-              <Ionicons name="qr-code-outline" size={16} color="#ffffff" style={{ marginRight: 6 }} />
-              <Text style={styles.syncButtonText}>Open {subOrgName} Scanner</Text>
-            </View>
-          </TouchableOpacity>
-        </View>
-      ) : null}
-
-      {/* 1. Offline Storage & Sync Card */}
-      <View style={[styles.card, subOrgName ? { marginTop: 16 } : {}]}>
-        <Text style={styles.cardHeader}>Offline Attendance Sync</Text>
-        <View style={styles.syncRow}>
-          <View>
-            <Text style={styles.syncTitle}>Pending Offline Scans</Text>
-            <Text style={styles.syncSub}>
-              {offlineQueue.length > 0
-                ? `${offlineQueue.length} attendance record(s) queued for upload`
-                : 'All scans synced with cloud server'}
-            </Text>
-          </View>
-          <View style={[styles.badge, offlineQueue.length > 0 ? styles.badgePending : styles.badgeSuccess]}>
-            <Text style={[styles.badgeText, offlineQueue.length > 0 ? styles.badgeTextPending : styles.badgeTextSuccess]}>
-              {offlineQueue.length} QUEUED
-            </Text>
-          </View>
-        </View>
+      {/* 1. Universal Member QR Code Card (Works Offline for All FCO & Sub-Orgs) */}
+      <View style={styles.card}>
+        <Text style={styles.cardHeader}>Universal Member QR Code</Text>
+        <Text style={styles.cardSubText}>
+          Present this QR code to event admins to log attendance instantly, even without internet connection.
+        </Text>
 
         <TouchableOpacity
-          onPress={handleSyncOfflineData}
-          disabled={syncing || offlineQueue.length === 0}
-          style={[styles.syncButton, (syncing || offlineQueue.length === 0) && styles.syncButtonDisabled]}
+          onPress={() => setProfileQrModalVisible(true)}
+          style={styles.qrPreviewContainer}
           activeOpacity={0.85}
         >
-          {syncing ? (
-            <ActivityIndicator color="#ffffff" size="small" />
-          ) : (
-            <View style={styles.btnContent}>
-              <Ionicons name="cloud-upload-outline" size={16} color="#ffffff" style={{ marginRight: 6 }} />
-              <Text style={styles.syncButtonText}>Sync Scans Now</Text>
-            </View>
-          )}
+          <View style={styles.miniQrWrapper}>
+            <QRCode value={studentQrPayload} size={84} backgroundColor="#ffffff" color="#0f172a" />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.qrCardTitle}>View Full-Screen QR</Text>
+            <Text style={styles.qrCardSub}>Contains your Student ID, Name, and Program for offline scanning.</Text>
+          </View>
+          <Ionicons name="expand-outline" size={20} color="#8b0000" />
         </TouchableOpacity>
       </View>
 
       {/* 2. Security & Account Actions */}
       <View style={[styles.card, { marginTop: 16 }]}>
         <Text style={styles.cardHeader}>Security & Account</Text>
+
+        {/* Sub-Org Scanner Trigger */}
+        {chapterCode !== 'Sub-Org' && (
+          <TouchableOpacity
+            onPress={() => setSubOrgScannerVisible(true)}
+            style={styles.settingsRow}
+            activeOpacity={0.7}
+          >
+            <View style={styles.rowLeft}>
+              <Ionicons name="qr-code-outline" size={18} color="#854d0e" style={styles.rowIcon} />
+              <Text style={[styles.rowTitle, { color: '#854d0e' }]}>Scan {chapterCode} Chapter QR</Text>
+            </View>
+            <Ionicons name="chevron-forward-outline" size={18} color="#94a3b8" />
+          </TouchableOpacity>
+        )}
 
         <TouchableOpacity
           onPress={() => setPasswordModalVisible(true)}
@@ -242,7 +174,7 @@ export default function SettingsTab({ profile, onSignOut, onOpenChapterScanner }
         </TouchableOpacity>
 
         <TouchableOpacity
-          onPress={onSignOut}
+          onPress={() => setSignOutModalVisible(true)}
           style={[styles.settingsRow, { borderBottomWidth: 0 }]}
           activeOpacity={0.7}
         >
@@ -254,7 +186,49 @@ export default function SettingsTab({ profile, onSignOut, onOpenChapterScanner }
         </TouchableOpacity>
       </View>
 
-      {/* 3. Password Change Modal */}
+      {/* 3. Full-Screen Profile QR Code Modal */}
+      <Modal
+        visible={profileQrModalVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setProfileQrModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalCard, { alignItems: 'center', paddingVertical: 24 }]}>
+            <View style={[styles.modalHeader, { width: '100%', marginBottom: 16 }]}>
+              <Text style={styles.modalTitle}>My Member QR Code</Text>
+              <TouchableOpacity onPress={() => setProfileQrModalVisible(false)}>
+                <Ionicons name="close" size={22} color="#64748b" />
+              </TouchableOpacity>
+            </View>
+
+            <Text style={{ fontSize: 11, color: '#64748b', textAlign: 'center', marginBottom: 20 }}>
+              Use this code for offline attendance scanning across all FCO and sub-organizations.
+            </Text>
+
+            <View style={styles.largeQrContainer}>
+              <QRCode value={studentQrPayload} size={200} backgroundColor="#ffffff" color="#0f172a" />
+            </View>
+
+            <View style={styles.qrProfileInfoBox}>
+              <Text style={styles.qrStudentName}>{profile?.full_name || 'Student Member'}</Text>
+              <Text style={styles.qrStudentId}>{profile?.student_id || 'ID N/A'}</Text>
+              <Text style={styles.qrStudentCourse}>
+                {profile?.course || 'BSCE'} • {profile?.year_level ? `Year ${profile.year_level}` : ''} {profile?.section ? `Sec ${profile.section}` : ''}
+              </Text>
+            </View>
+
+            <TouchableOpacity
+              onPress={() => setProfileQrModalVisible(false)}
+              style={[styles.submitBtn, { width: '100%', marginTop: 20 }]}
+            >
+              <Text style={styles.submitBtnText}>Done</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* 4. Password Change Modal */}
       <Modal
         visible={passwordModalVisible}
         transparent={true}
@@ -371,6 +345,58 @@ export default function SettingsTab({ profile, onSignOut, onOpenChapterScanner }
           </View>
         </View>
       </Modal>
+
+      {/* 5. Sign Out Confirmation Modal */}
+      <Modal
+        visible={signOutModalVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setSignOutModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Sign Out</Text>
+              <TouchableOpacity onPress={() => setSignOutModalVisible(false)}>
+                <Ionicons name="close" size={22} color="#64748b" />
+              </TouchableOpacity>
+            </View>
+
+            <Text style={{ fontSize: 13, color: '#475569', marginBottom: 20, lineHeight: 18 }}>
+              Are you sure you want to sign out of your student session?
+            </Text>
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                onPress={() => setSignOutModalVisible(false)}
+                style={styles.cancelBtn}
+              >
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={() => {
+                  setSignOutModalVisible(false);
+                  onSignOut();
+                }}
+                style={[styles.submitBtn, { backgroundColor: '#8b0000' }]}
+              >
+                <Text style={styles.submitBtnText}>Yes, Sign Out</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* 6. Sub-Organization QR Scanner Modal */}
+      <SubOrgQRScannerModal
+        visible={subOrgScannerVisible}
+        profile={profile}
+        onClose={() => setSubOrgScannerVisible(false)}
+        onScanComplete={() => {
+          setSubOrgScannerVisible(false);
+        }}
+      />
     </ScrollView>
   );
 }
@@ -381,21 +407,49 @@ const styles = StyleSheet.create({
   greetingSub: { fontSize: 11, fontWeight: '800', color: '#8b0000', letterSpacing: 1.5 },
   greetingName: { fontSize: 22, fontWeight: '900', color: '#0f172a', marginTop: 2 },
   card: { backgroundColor: '#ffffff', borderRadius: 20, padding: 18, borderWidth: 1.5, borderColor: '#e2e8f0' },
-  cardHeader: { fontSize: 11, fontWeight: '900', color: '#8b0000', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 12 },
-  syncRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
-  syncTitle: { fontSize: 13, fontWeight: '800', color: '#0f172a' },
-  syncSub: { fontSize: 11, color: '#64748b', marginTop: 2 },
-  syncSubStyle: { fontSize: 11, color: '#64748b', lineHeight: 16 },
-  badge: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8, borderWidth: 1 },
-  badgePending: { backgroundColor: '#fef2f2', borderColor: '#fecaca' },
-  badgeSuccess: { backgroundColor: '#ecfdf5', borderColor: '#a7f3d0' },
-  badgeText: { fontSize: 10, fontWeight: '900' },
-  badgeTextPending: { color: '#8b0000' },
-  badgeTextSuccess: { color: '#059669' },
-  syncButton: { backgroundColor: '#8b0000', height: 44, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
-  syncButtonDisabled: { opacity: 0.5 },
-  btnContent: { flexDirection: 'row', alignItems: 'center' },
-  syncButtonText: { color: '#ffffff', fontSize: 12, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.5 },
+  cardHeader: { fontSize: 11, fontWeight: '900', color: '#8b0000', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 },
+  cardSubText: { fontSize: 11, color: '#64748b', marginBottom: 12, lineHeight: 16 },
+  qrPreviewContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#f8fafc',
+    borderRadius: 14,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    gap: 12,
+  },
+  miniQrWrapper: {
+    backgroundColor: '#ffffff',
+    padding: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+  },
+  qrCardTitle: { fontSize: 13, fontWeight: '800', color: '#0f172a' },
+  qrCardSub: { fontSize: 11, color: '#64748b', marginTop: 2, lineHeight: 15 },
+  largeQrContainer: {
+    backgroundColor: '#ffffff',
+    padding: 16,
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: '#cbd5e1',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
+  },
+  qrProfileInfoBox: {
+    alignItems: 'center',
+    width: '100%',
+    backgroundColor: '#f8fafc',
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  qrStudentName: { fontSize: 14, fontWeight: '900', color: '#0f172a' },
+  qrStudentId: { fontSize: 12, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', fontWeight: '800', color: '#8b0000', marginTop: 2 },
+  qrStudentCourse: { fontSize: 11, color: '#64748b', fontWeight: '600', marginTop: 2 },
   settingsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 14, paddingHorizontal: 4, borderBottomWidth: 1, borderColor: '#f1f5f9' },
   rowLeft: { flexDirection: 'row', alignItems: 'center' },
   rowIcon: { marginRight: 10 },
@@ -414,14 +468,13 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
     borderColor: '#e2e8f0',
     borderRadius: 10,
-    paddingHorizontal: 12,
+    paddingHorizontal: 16,
   },
   passwordInput: {
     flex: 1,
     height: '100%',
     fontSize: 13,
     color: '#0f172a',
-    outlineStyle: 'none', 
   },
   eyeBtn: {
     paddingLeft: 8,

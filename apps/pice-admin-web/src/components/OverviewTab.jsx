@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Calendar, Users, Receipt, TrendingUp, CheckCircle2 } from 'lucide-react';
-import { supabase, PICE_ORG_ID } from '../services/supabase';
+import { supabase } from '../services/supabase'; // Main FCO database for profiles
+import { piceClient, PICE_ORG_ID } from '../services/piceClient'; // Secondary database for PICE tables
 
 export default function OverviewTab() {
   const [loading, setLoading] = useState(true);
@@ -13,39 +14,42 @@ export default function OverviewTab() {
     fetchOverviewData();
   }, []);
 
-  // 🚀 LIGHTNING-FAST: Optimized with Promise.all and head-only count queries
   const fetchOverviewData = async () => {
     try {
       setLoading(true);
 
-      // 1. Fetch PICE events first so we have the event IDs for attendance count
-      const { data: eventsData } = await supabase
+      // 1. Fetch PICE events from Secondary Database via piceClient
+      const { data: eventsData, error: eventErr } = await piceClient
         .from('pice_events')
         .select('id')
         .eq('organization_id', PICE_ORG_ID);
 
+      if (eventErr) {
+        console.error('Error fetching pice_events:', eventErr.message);
+      }
+
       const eventsList = eventsData || [];
       const eventIds = eventsList.map(e => e.id);
 
-      // 2. Fire independent queries in parallel using Promise.all for maximum speed
+      // 2. Fire independent queries in parallel using Promise.all
       const [studentsRes, attendanceRes, finesRes] = await Promise.all([
-        // Exact student count header without downloading rows
+        // Exact student count from Main FCO profiles database
         supabase
           .from('profiles')
           .select('*', { count: 'exact', head: true })
           .or('course.ilike.%BSCE%,course.ilike.%CIVIL%'),
 
-        // Exact attendance count header filtered by PICE event IDs
+        // Exact attendance count from Secondary Database filtered by PICE event IDs
         eventIds.length > 0
-          ? supabase
+          ? piceClient
               .from('pice_attendance')
               .select('*', { count: 'exact', head: true })
               .in('event_id', eventIds)
-          : Promise.resolve({ count: 0 }),
+          : Promise.resolve({ count: 0, error: null }),
 
-        // Fetch fines ledger for calculations
-        supabase
-          .from('fines')
+        // Fetch fines ledger from Secondary Database via piceClient
+        piceClient
+          .from('pice_fines')
           .select('amount, status')
           .eq('organization_id', PICE_ORG_ID)
       ]);
@@ -57,7 +61,8 @@ export default function OverviewTab() {
       // Compute total unpaid fines in memory instantly
       if (finesRes.data) {
         const sum = finesRes.data.reduce((acc, f) => {
-          if (['unpaid', 'pending_approval'].includes(String(f.status || '').toLowerCase())) {
+          const status = String(f.status || '').toLowerCase();
+          if (['unpaid', 'pending_approval'].includes(status)) {
             return acc + (parseFloat(f.amount) || 0);
           }
           return acc;
@@ -89,7 +94,7 @@ export default function OverviewTab() {
         <MetricCard title="Total PICE Students" value={loading ? '...' : studentCount} icon={<Users size={20} color="#b45309" />} trend="BSCE / Civil Enrolled" />
         <MetricCard title="Active PICE Events" value={loading ? '...' : eventCount} icon={<Calendar size={20} color="#0284c7" />} trend="Isolated to PICE" />
         <MetricCard title="Attendance Logs" value={loading ? '...' : attendanceCount} icon={<CheckCircle2 size={20} color="#16a34a" />} trend="Scanned via QR" />
-        <MetricCard title="Total Fines Recorded" value={loading ? '...' : `${totalFinesValue.toFixed(2)}`} icon={<Receipt size={20} color="#dc2626" />} trend="Outstanding ledger" />
+        <MetricCard title="Total Fines Recorded" value={loading ? '...' : `₱${totalFinesValue.toFixed(2)}`} icon={<Receipt size={20} color="#dc2626" />} trend="Outstanding ledger" />
       </div>
 
       {/* Analytics Breakdown Grid */}
