@@ -90,16 +90,31 @@ export default function AttendanceTab({ currentUser }) {
     }
   };
 
-  const fetchStudentsList = async () => {
+ const fetchStudentsList = async () => {
     try {
-      const { data, error } = await supabase
+      // Kunin ang unang batch (0 to 999)
+      const { data: batch1, error: err1 } = await supabase
         .from('profiles')
         .select('id, full_name, student_id, course')
         .order('full_name', { ascending: true })
-        .limit(2000);
+        .range(0, 999);
 
-      if (error) throw error;
-      setStudents(data || []);
+      if (err1) throw err1;
+
+      // Kunin ang pangalawang batch para sa mga lumagpas ng 1000 (1000 hanggang 2000)
+      const { data: batch2, error: err2 } = await supabase
+        .from('profiles')
+        .select('id, full_name, student_id, course')
+        .order('full_name', { ascending: true })
+        .range(1000, 2000);
+
+      if (err2) throw err2;
+
+      // Pagsamahin ang dalawang batch
+      const allStudents = [...(batch1 || []), ...(batch2 || [])];
+
+      setStudents(allStudents);
+      console.log("Total students loaded successfully:", allStudents.length); // Dito dapat umabot na ng 1200+
     } catch (err) {
       console.error('Error fetching student list:', err);
     }
