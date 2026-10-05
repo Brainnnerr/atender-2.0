@@ -96,7 +96,7 @@ export default function AttendanceTab({ currentUser }) {
         .from('profiles')
         .select('id, full_name, student_id, course')
         .order('full_name', { ascending: true })
-        .limit(1500);
+        .limit(2000);
 
       if (error) throw error;
       setStudents(data || []);
